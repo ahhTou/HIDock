@@ -34,7 +34,7 @@ Mac 键盘/触控板 → HIDock 捕获 → BLE HID 报文 → 📱 手机系统�
 ## 🚀 快速开始
 
 ```bash
-git clone https://github.com/xxx/HIDock.git   # 换成你的地址
+git clone https://github.com/ahhTou/HIDock.git
 cd HIDock
 swiftc -O -o HIDock main.swift
 ./HIDock
