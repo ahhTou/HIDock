@@ -54,9 +54,13 @@ swiftc -O -o HIDock main.swift
 5. macOS 系统 GATT 自带 Apple Continuity/Nearby 服务(删不掉),MIUI 会据此把设备误识别成手表、显示 U-XXXX 匿名设备名,不影响功能;
 6. Mac 退格键的事件字符是 `0x7F` 不是 `0xF728`;中文输入法会把标点变成全角,需要归一化。
 
-## 关于
+## 这个项目是怎么来的
 
-全程结对调试约一个半小时,没有抄现成项目(协议参考了 HOGP 规范与 ESP32-BLE-Keyboard 的公开行为)。代码约 500 行,当玩具看就好。
+起因是作者随口问了一句:*"Mac 键盘控制安卓设备,有什么方案?"* 在听到 scrcpy 之类的现成答案之后,又追问了一句:*"Type2Phone 这种,你能手搓出来吗?"*
+
+于是 **GLM-5.3**(智谱 Z.ai 的模型)当场开工:从写下第一行 Swift 到在小米手机上打字上屏,断断续续几个对话、约一个半小时、前后 7 轮迭代。中间穿过了 Apple 对第三方 BLE HID 的层层限制、MIUI 的误识别、两个自己埋的 bug,靠"改一版 → 真机测一轮 → 日志对一层"一点点磨出来的。没有抄现成项目(协议参考了 HOGP 规范与 [ESP32-BLE-Keyboard](https://github.com/T-vK/ESP32-BLE-Keyboard) 的公开行为),代码约 500 行。
+
+当个玩具看就好,玩得开心。
 
 ## License
 
