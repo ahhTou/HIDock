@@ -339,20 +339,42 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 }
 
-// ---------- 捕获按键的视图 ----------
+// ---------- 手机面板:打字 + 触控板合一 ----------
+// 面板尺寸 = 小米 17 Ultra 机身 1:1(77.6mm × 162.9mm ≈ 220 × 462pt,1pt = 0.3528mm)
+let kPhoneW: CGFloat = 220
+let kPhoneH: CGFloat = 462
+
 final class CaptureView: NSView {
     let kb = sharedKeyboard
+    var onMouseReport: ((Data) -> Void)?
+    var trackpadEnabled = true
+    private var mButtons: UInt8 = 0
+    private var pendingDx = 0, pendingDy = 0, pendingWheel = 0
+    private var lastSent = Date.distantPast
+    private var lastMoveLog = Date.distantPast
+
     override var acceptsFirstResponder: Bool { true }
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
-        bounds.fill()
-        let hint = "① 手机蓝牙设置 → 配对 \"HIDock\"\n② 点一下本区域,打字即实时发送到手机\n(英文/数字/符号/回车退格方向键均支持;中文见 README)"
-        (hint as NSString).draw(at: NSPoint(x: 20, y: bounds.height - 60),
-            withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                             .foregroundColor: NSColor.secondaryLabelColor])
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for t in trackingAreas { removeTrackingArea(t) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseMoved, .activeInKeyWindow, .enabledDuringMouseDrag],
+            owner: self, userInfo: nil))
     }
 
-    // Mac 中文输入法会把标点变成全角(，。／等),折回半角再查表
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 28, yRadius: 28)
+        NSColor(calibratedWhite: 0.13, alpha: 1).setFill()
+        path.fill()
+        let hint = "点按面板获得焦点后打字\n光标在面板上滑动 = 手机触控板\n单击=左键 · 右键=返回 · 双指滚动(修复中)"
+        (hint as NSString).draw(at: NSPoint(x: 14, y: bounds.height - 46),
+            withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
+                             .foregroundColor: NSColor.lightGray])
+    }
+
+    // ===== 键盘 =====
+    // Mac 中文输入法会把标点变成全角(,。/等),折回半角再查表
     private func normalizeFullWidth(_ c: Character) -> Character? {
         guard let scalar = c.unicodeScalars.first, (0xFF01...0xFF5E).contains(scalar.value) else { return nil }
         guard let ascii = Unicode.Scalar(scalar.value - 0xFEE0) else { return nil }
@@ -360,7 +382,6 @@ final class CaptureView: NSView {
     }
 
     private func usageFor(_ event: NSEvent) -> (UInt8, Bool)? {
-        // 先查带 Shift 的实际字符(大写/符号),再查裸字符,最后查功能键
         if let chars = event.characters {
             for c in chars {
                 if let (u, s) = charToUsage[c] { return (u, s) }
@@ -384,71 +405,68 @@ final class CaptureView: NSView {
     override func keyUp(with event: NSEvent) {
         if let (u, s) = usageFor(event) { kb.keyUp(usage: u, shifted: s); appDelegate.logKey(u, down: false) }
     }
-    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
     override func flagsChanged(with event: NSEvent) {
         kb.modifiersChanged(HidKeyboard.modifierBits(event.modifierFlags))
     }
-}
 
-// ---------- 触控板视图:窗口即触摸面 ----------
-final class TrackpadView: NSView {
-    var onReport: ((Data) -> Void)?
-    private var buttons: UInt8 = 0
-    private var pendingDx = 0, pendingDy = 0, pendingWheel = 0
-    private var lastSent = Date.distantPast
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        for t in trackingAreas { removeTrackingArea(t) }
-        addTrackingArea(NSTrackingArea(rect: bounds,
-            options: [.mouseMoved, .activeInKeyWindow, .enabledDuringMouseDrag],
-            owner: self, userInfo: nil))
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.underPageBackgroundColor.setFill()
-        bounds.fill()
-        let hint = "触控板:在此区域移动光标 = 手机指针 · 点击 = 左键 · 右键 = 返回 · 双指上下滚动"
-        (hint as NSString).draw(at: NSPoint(x: 20, y: bounds.height - 26),
-            withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                             .foregroundColor: NSColor.secondaryLabelColor])
+    // ===== 触控板 =====
+    private func moveLog(_ tag: String, _ event: NSEvent) {
+        guard Date().timeIntervalSince(lastMoveLog) > 0.3 else { return }
+        lastMoveLog = Date()
+        NSLog("HIDock: [%@] dx=%.1f dy=%.1f scroll=%.1f momentum=%d", tag,
+              event.deltaX, event.deltaY, event.scrollingDeltaY, event.momentumPhase.rawValue)
     }
 
     // 8ms 节流合帧:事件来太密时累加增量,别把 BLE 队列打爆
     private func enqueue(dx: Int, dy: Int, wheel: Int = 0, force: Bool = false) {
+        guard trackpadEnabled else { return }
         pendingDx += dx; pendingDy += dy; pendingWheel += wheel
-        guard force || buttons != 0 || Date().timeIntervalSince(lastSent) >= 0.008 else { return }
+        guard force || mButtons != 0 || Date().timeIntervalSince(lastSent) >= 0.008 else { return }
         guard force || pendingDx != 0 || pendingDy != 0 || pendingWheel != 0 else { return }
-        var d = Data([buttons])
-        var v = Int16(clamping: pendingDx).littleEndian
-        withUnsafeBytes(of: &v) { d.append(contentsOf: $0) }
-        v = Int16(clamping: pendingDy).littleEndian
-        withUnsafeBytes(of: &v) { d.append(contentsOf: $0) }
+        func le16(_ x: Int) -> [UInt8] {
+            let u = UInt16(bitPattern: Int16(clamping: x))
+            return [UInt8(u & 0xFF), UInt8(u >> 8)]
+        }
+        var d = Data([mButtons])
+        d.append(contentsOf: le16(pendingDx))
+        d.append(contentsOf: le16(pendingDy))
         d.append(UInt8(Int8(clamping: pendingWheel)))
-        onReport?(d)
+        onMouseReport?(d)
         pendingDx = 0; pendingDy = 0; pendingWheel = 0
         lastSent = Date()
     }
 
+    // CGFloat → Int 防御:NaN/无穷/溢出在 Int() 里是运行时陷阱
+    private static func clampDelta(_ f: CGFloat) -> Int {
+        guard f.isFinite, abs(f) < 30000 else { return 0 }
+        return Int(f)
+    }
+
     override func mouseMoved(with event: NSEvent) {
-        // Cocoa Y 轴向上为正,HID 鼠标 Y 向下为正 → 取反;方向反了就换符号
-        enqueue(dx: Int(event.deltaX), dy: Int(-event.deltaY))
+        moveLog("move", event)
+        // 实测 Y 与直觉相反:dy 直接用正 delta(再反了就改回负号)
+        enqueue(dx: CaptureView.clampDelta(event.deltaX), dy: CaptureView.clampDelta(event.deltaY))
     }
     override func mouseDragged(with event: NSEvent) {
-        enqueue(dx: Int(event.deltaX), dy: Int(-event.deltaY))
+        enqueue(dx: CaptureView.clampDelta(event.deltaX), dy: CaptureView.clampDelta(event.deltaY))
     }
     override func otherMouseDragged(with event: NSEvent) {
-        enqueue(dx: Int(event.deltaX), dy: Int(-event.deltaY))
+        enqueue(dx: CaptureView.clampDelta(event.deltaX), dy: CaptureView.clampDelta(event.deltaY))
     }
     override func scrollWheel(with event: NSEvent) {
-        enqueue(dx: 0, dy: 0, wheel: Int(-event.scrollingDeltaY))
+        moveLog("scroll", event)
+        // 滚轮路径曾两次在 enqueue 内 EXC_BREAKPOINT 崩溃,停用排查中
+        return
     }
 
     private func setButton(_ bit: UInt8, on: Bool) {
-        if on { buttons |= bit } else { buttons &= ~bit }
+        if on { mButtons |= bit } else { mButtons &= ~bit }
         enqueue(dx: 0, dy: 0, force: true)
     }
-    override func mouseDown(with event: NSEvent) { setButton(0x01, on: true) }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        setButton(0x01, on: true)
+    }
     override func mouseUp(with event: NSEvent) { setButton(0x01, on: false) }
     override func rightMouseDown(with event: NSEvent) { setButton(0x02, on: true) }
     override func rightMouseUp(with event: NSEvent) { setButton(0x02, on: false) }
@@ -459,17 +477,51 @@ final class TrackpadView: NSView {
 // ---------- App ----------
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
+    var container: NSView!
     var statusLabel: NSTextField!
     var logLabel: NSTextField!
-    var captureView: CaptureView!
-    var trackpadView: TrackpadView!
+    var phonePanel: CaptureView!
+    var orientButton: NSButton!
+    var trackpadButton: NSButton!
+    var resetButton: NSButton!
     let ble = BlePeripheral()
+    var landscape = false
+    static let toolbarH: CGFloat = 64
 
     var kb: HidKeyboard { sharedKeyboard }
     func logKey(_ u: UInt8, down: Bool) {
         DispatchQueue.main.async {
             self.logLabel.stringValue = String(format: "%@ usage=0x%02X", down ? "↓" : "↑", u)
         }
+    }
+
+    @objc func toggleOrientation(_ sender: NSButton) {
+        landscape.toggle()
+        layoutWindow()
+    }
+    @objc func toggleTrackpad(_ sender: NSButton) {
+        phonePanel.trackpadEnabled.toggle()
+        sender.title = phonePanel.trackpadEnabled ? "触控板:开" : "触控板:关"
+    }
+    @objc func resetSize(_ sender: NSButton) { layoutWindow() }
+
+    // 按当前横竖方向重排:面板 1:1 真机尺寸,工具栏在上方
+    func layoutWindow() {
+        let panelW = landscape ? kPhoneH : kPhoneW
+        let panelH = landscape ? kPhoneW : kPhoneH
+        let totalH = panelH + Self.toolbarH
+        container.frame = NSRect(x: 0, y: 0, width: panelW, height: totalH)
+        phonePanel.frame = NSRect(x: 0, y: 0, width: panelW, height: panelH)
+        statusLabel.frame = NSRect(x: 10, y: panelH + 44, width: panelW - 20, height: 16)
+        logLabel.frame = NSRect(x: 10, y: panelH + 28, width: panelW - 20, height: 14)
+        let bw: CGFloat = 64, gap: CGFloat = 8
+        let x0 = (panelW - (3 * bw + 2 * gap)) / 2
+        orientButton.frame = NSRect(x: x0, y: panelH + 2, width: bw, height: 22)
+        trackpadButton.frame = NSRect(x: x0 + bw + gap, y: panelH + 2, width: bw, height: 22)
+        resetButton.frame = NSRect(x: x0 + 2 * (bw + gap), y: panelH + 2, width: bw, height: 22)
+        orientButton.title = landscape ? "切竖屏" : "切横屏"
+        window.setContentSize(NSSize(width: panelW, height: totalH))
+        window.center()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -485,33 +537,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 520),
-                          styleMask: [.titled, .closable, .miniaturizable],
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: kPhoneW, height: kPhoneH + Self.toolbarH),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
-        window.title = "HIDock — 键盘 ⌨️ + 触控板 👆"
+        window.title = "HIDock — 手机面板"
 
+        container = NSView(frame: NSRect(x: 0, y: 0, width: kPhoneW, height: kPhoneH + Self.toolbarH))
         statusLabel = NSTextField(labelWithString: "初始化蓝牙…")
-        statusLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        statusLabel.frame = NSRect(x: 20, y: 480, width: 420, height: 20)
-
+        statusLabel.font = .systemFont(ofSize: 11, weight: .semibold)
         logLabel = NSTextField(labelWithString: "")
-        logLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        logLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         logLabel.textColor = .tertiaryLabelColor
-        logLabel.frame = NSRect(x: 20, y: 458, width: 420, height: 16)
 
-        captureView = CaptureView(frame: NSRect(x: 0, y: 224, width: 460, height: 226))
-        trackpadView = TrackpadView(frame: NSRect(x: 0, y: 16, width: 460, height: 200))
-        trackpadView.onReport = { appDelegate.ble.sendMouseReport($0) }
+        phonePanel = CaptureView(frame: NSRect(x: 0, y: 0, width: kPhoneW, height: kPhoneH))
+        phonePanel.onMouseReport = { appDelegate.ble.sendMouseReport($0) }
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 520))
+        orientButton = NSButton(title: "切横屏", target: self, action: #selector(toggleOrientation(_:)))
+        trackpadButton = NSButton(title: "触控板:开", target: self, action: #selector(toggleTrackpad(_:)))
+        resetButton = NSButton(title: "1:1 大小", target: self, action: #selector(resetSize(_:)))
+        orientButton.bezelStyle = .rounded
+        trackpadButton.bezelStyle = .rounded
+        resetButton.bezelStyle = .rounded
+
         container.addSubview(statusLabel)
         container.addSubview(logLabel)
-        container.addSubview(captureView)
-        container.addSubview(trackpadView)
+        container.addSubview(orientButton)
+        container.addSubview(trackpadButton)
+        container.addSubview(resetButton)
+        container.addSubview(phonePanel)
         window.contentView = container
-        window.center()
+        layoutWindow()
         window.makeKeyAndOrderFront(nil)
-        window.initialFirstResponder = captureView
+        window.initialFirstResponder = phonePanel
         NSApp.activate(ignoringOtherApps: true)
     }
 
