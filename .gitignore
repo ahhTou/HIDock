@@ -1,0 +1,6 @@
+HIDock
+probe
+scanner
+app.log
+*.xcodeproj
+.DS_Store
