@@ -28,6 +28,7 @@ let manufacturerUUID    = CBUUID(string: "00002A29-0000-1000-8000-00805F9B34FB")
 let modelNumberUUID     = CBUUID(string: "00002A24-0000-1000-8000-00805F9B34FB")
 
 // 标准键盘 report map:Report ID 1 = modifier(1B) + 保留(1B) + 键(6B)
+// 追加鼠标 report map:Report ID 2 = 按键(1B) + X/Y 相对位移(各2B) + 滚轮(1B)
 let reportMapData = Data([
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x06,       // Usage (Keyboard)
@@ -44,7 +45,33 @@ let reportMapData = Data([
     0x15, 0x00, 0x25, 0x65,  //   Logical Min/Max (keycodes)
     0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
     0x81, 0x00,       //   Input (Data, Array)
-    0xC0              // End Collection
+    0xC0,             // End Collection (Keyboard)
+
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x02,       // Usage (Mouse)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, 0x02,       //   Report ID (2)
+    0x09, 0x01,       //   Usage (Pointer)
+    0xA1, 0x00,       //   Collection (Physical)
+    0x05, 0x09,       //     Usage Page (Buttons)
+    0x19, 0x01, 0x29, 0x03,  //   Buttons 1–3
+    0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x03,
+    0x81, 0x02,       //     Input (Data, Var, Abs)
+    0x75, 0x05, 0x95, 0x01,
+    0x81, 0x01,       //     Input (Const) — 5bit 填充
+    0x05, 0x01,       //     Usage Page (Generic Desktop)
+    0x09, 0x30, 0x09, 0x31,  //   Usage X / Y
+    0x16, 0x01, 0x80, //     Logical Min (-32767)
+    0x26, 0xFF, 0x7F, //     Logical Max (32767)
+    0x75, 0x10, 0x95, 0x02,
+    0x81, 0x06,       //     Input (Data, Var, Rel)
+    0x09, 0x38,       //     Usage (Wheel)
+    0x15, 0x81, 0x25, 0x7F,  //   Logical Min/Max (-127/127)
+    0x75, 0x08, 0x95, 0x01,
+    0x81, 0x06,       //     Input (Data, Var, Rel)
+    0xC0,             //   End Collection (Physical)
+    0xC0              // End Collection (Mouse)
 ])
 
 // ---------- 键码映射 ----------
@@ -141,8 +168,11 @@ let sharedKeyboard = HidKeyboard()
 final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     var pm: CBPeripheralManager!
     var reportChar: CBMutableCharacteristic!
+    var mouseReportChar: CBMutableCharacteristic!
     var protocolModeChar: CBMutableCharacteristic!
     var subscribedCentrals: [UUID: CBCentral] = [:]
+    var mouseSubscribedCentrals: [UUID: CBCentral] = [:]
+    var lastMouseReport = Data(repeating: 0, count: 6)
     var authedCentrals = Set<UUID>()
     var onStatus: (String) -> Void = { _ in }
     var onCentralsChanged: (Int) -> Void = { _ in }
@@ -177,6 +207,12 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
                                                  value: nil, permissions: reportPerms)
             reportChar.descriptors = [reportRef]
 
+            // 鼠标 Report(Report ID 2):与键盘 Report 同 UUID、不同实例,各自挂 2908 描述符
+            let mouseRef = CBMutableDescriptor(type: reportRefDescUUID, value: Data([0x02, 0x01])) // Report ID 2, Input
+            mouseReportChar = CBMutableCharacteristic(type: reportUUID, properties: [.read, .notify],
+                                                      value: nil, permissions: reportPerms)
+            mouseReportChar.descriptors = [mouseRef]
+
             let hidInfo = CBMutableCharacteristic(type: hidInfoUUID, properties: .read,
                 value: Data([0x11, 0x01, 0x02]), permissions: [.readable])  // HID 1.1, normally connectable
             let reportMap = CBMutableCharacteristic(type: reportMapUUID, properties: .read,
@@ -188,7 +224,7 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
                 value: nil, permissions: [.readable, .writeable])  // 1 = Report Protocol
 
             let hid = CBMutableService(type: hidServiceUUID, primary: true)
-            hid.characteristics = [hidInfo, reportMap, controlPoint, protocolModeChar, reportChar]
+            hid.characteristics = [hidInfo, reportMap, controlPoint, protocolModeChar, reportChar, mouseReportChar]
             pm.add(hid)
         default:
             startAdv()
@@ -229,18 +265,23 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
             request.value = data.subdata(in: request.offset..<data.count)
             peripheral.respond(to: request, withResult: .success)
         }
-        switch c.uuid {
+        // 两个 Report 特征同 UUID,按实例区分
+        if c === reportChar {
+            serve(sharedKeyboard.lastReport)
+        } else if c === mouseReportChar {
+            serve(lastMouseReport)
+        } else { switch c.uuid {
         case reportMapUUID:
             // 不设认证门槛:安卓 GATT 发现阶段读到 insufficientAuthentication 会放弃 HID 服务,
             // 转而按残余服务把设备归为穿戴设备("识别成手表"的根源),明文返回即可
             serve(reportMapData)
         case hidInfoUUID:      serve(Data([0x11, 0x01, 0x02]))
         case protocolModeUUID: serve(Data([0x01]))
-        case reportUUID:       serve(sharedKeyboard.lastReport)
         case batteryLevelUUID: serve(Data([100]))
         case manufacturerUUID: serve(Data("ZCode".utf8))
         case modelNumberUUID:  serve(Data("HIDock-手搓版".utf8))
         default: peripheral.respond(to: request, withResult: .readNotPermitted)
+        }
         }
     }
 
@@ -254,28 +295,47 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
-        guard characteristic.uuid == reportUUID else { return }
-        subscribedCentrals[central.identifier] = central
-        onCentralsChanged(subscribedCentrals.count)
-        onStatus("已连接 ✓ 现在在窗口里打字即可上手机")
+        if characteristic === mouseReportChar {
+            mouseSubscribedCentrals[central.identifier] = central
+            onStatus("鼠标通道就绪 ✓ 窗口下方触控板区域可用")
+        } else if characteristic.uuid == reportUUID {
+            subscribedCentrals[central.identifier] = central
+            onStatus("已连接 ✓ 现在在窗口里打字即可上手机")
+        }
+        onCentralsChanged(subscribedCentrals.count + mouseSubscribedCentrals.count)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
         subscribedCentrals.removeValue(forKey: central.identifier)
-        onCentralsChanged(subscribedCentrals.count)
-        if subscribedCentrals.isEmpty {
+        mouseSubscribedCentrals.removeValue(forKey: central.identifier)
+        onCentralsChanged(subscribedCentrals.count + mouseSubscribedCentrals.count)
+        if subscribedCentrals.isEmpty && mouseSubscribedCentrals.isEmpty {
             onStatus("已断开,重新广播等待回连…")
             if !pm.isAdvertising { startAdv() }
         }
     }
 
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
-        _ = pm.updateValue(sharedKeyboard.lastReport, for: reportChar, onSubscribedCentrals: Array(subscribedCentrals.values))
+        if !subscribedCentrals.isEmpty {
+            _ = pm.updateValue(sharedKeyboard.lastReport, for: reportChar, onSubscribedCentrals: Array(subscribedCentrals.values))
+        }
+        if !mouseSubscribedCentrals.isEmpty {
+            _ = pm.updateValue(lastMouseReport, for: mouseReportChar, onSubscribedCentrals: Array(mouseSubscribedCentrals.values))
+        }
     }
     func sendReport(_ data: Data) {
         guard pm.state == .poweredOn, !subscribedCentrals.isEmpty, let rc = reportChar else { return }
         let ok = pm.updateValue(data, for: rc, onSubscribedCentrals: Array(subscribedCentrals.values))
         NSLog("HIDock: [notify] %@ ok=%d", data.map { String(format: "%02X", $0) }.joined(), ok ? 1 : 0)
+    }
+    func sendMouseReport(_ data: Data) {
+        guard pm.state == .poweredOn, !mouseSubscribedCentrals.isEmpty, let rc = mouseReportChar else { return }
+        lastMouseReport = data
+        _ = pm.updateValue(data, for: rc, onSubscribedCentrals: Array(mouseSubscribedCentrals.values))
+        // 移动报文量大,只记录点击/滚动,避免日志刷屏
+        if data[0] != 0 || data[5] != 0 {
+            NSLog("HIDock: [mouse] %@", data.map { String(format: "%02X", $0) }.joined())
+        }
     }
 }
 
@@ -330,12 +390,79 @@ final class CaptureView: NSView {
     }
 }
 
+// ---------- 触控板视图:窗口即触摸面 ----------
+final class TrackpadView: NSView {
+    var onReport: ((Data) -> Void)?
+    private var buttons: UInt8 = 0
+    private var pendingDx = 0, pendingDy = 0, pendingWheel = 0
+    private var lastSent = Date.distantPast
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for t in trackingAreas { removeTrackingArea(t) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseMoved, .activeInKeyWindow, .enabledDuringMouseDrag],
+            owner: self, userInfo: nil))
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.underPageBackgroundColor.setFill()
+        bounds.fill()
+        let hint = "触控板:在此区域移动光标 = 手机指针 · 点击 = 左键 · 右键 = 返回 · 双指上下滚动"
+        (hint as NSString).draw(at: NSPoint(x: 20, y: bounds.height - 26),
+            withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                             .foregroundColor: NSColor.secondaryLabelColor])
+    }
+
+    // 8ms 节流合帧:事件来太密时累加增量,别把 BLE 队列打爆
+    private func enqueue(dx: Int, dy: Int, wheel: Int = 0, force: Bool = false) {
+        pendingDx += dx; pendingDy += dy; pendingWheel += wheel
+        guard force || buttons != 0 || Date().timeIntervalSince(lastSent) >= 0.008 else { return }
+        guard force || pendingDx != 0 || pendingDy != 0 || pendingWheel != 0 else { return }
+        var d = Data([buttons])
+        var v = Int16(clamping: pendingDx).littleEndian
+        withUnsafeBytes(of: &v) { d.append(contentsOf: $0) }
+        v = Int16(clamping: pendingDy).littleEndian
+        withUnsafeBytes(of: &v) { d.append(contentsOf: $0) }
+        d.append(UInt8(Int8(clamping: pendingWheel)))
+        onReport?(d)
+        pendingDx = 0; pendingDy = 0; pendingWheel = 0
+        lastSent = Date()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        // Cocoa Y 轴向上为正,HID 鼠标 Y 向下为正 → 取反;方向反了就换符号
+        enqueue(dx: Int(event.deltaX), dy: Int(-event.deltaY))
+    }
+    override func mouseDragged(with event: NSEvent) {
+        enqueue(dx: Int(event.deltaX), dy: Int(-event.deltaY))
+    }
+    override func otherMouseDragged(with event: NSEvent) {
+        enqueue(dx: Int(event.deltaX), dy: Int(-event.deltaY))
+    }
+    override func scrollWheel(with event: NSEvent) {
+        enqueue(dx: 0, dy: 0, wheel: Int(-event.scrollingDeltaY))
+    }
+
+    private func setButton(_ bit: UInt8, on: Bool) {
+        if on { buttons |= bit } else { buttons &= ~bit }
+        enqueue(dx: 0, dy: 0, force: true)
+    }
+    override func mouseDown(with event: NSEvent) { setButton(0x01, on: true) }
+    override func mouseUp(with event: NSEvent) { setButton(0x01, on: false) }
+    override func rightMouseDown(with event: NSEvent) { setButton(0x02, on: true) }
+    override func rightMouseUp(with event: NSEvent) { setButton(0x02, on: false) }
+    override func otherMouseDown(with event: NSEvent) { setButton(0x04, on: true) }
+    override func otherMouseUp(with event: NSEvent) { setButton(0x04, on: false) }
+}
+
 // ---------- App ----------
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var statusLabel: NSTextField!
     var logLabel: NSTextField!
     var captureView: CaptureView!
+    var trackpadView: TrackpadView!
     let ble = BlePeripheral()
 
     var kb: HidKeyboard { sharedKeyboard }
@@ -358,26 +485,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 320),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 520),
                           styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered, defer: false)
-        window.title = "HIDock — 手搓版 Type2Phone"
+        window.title = "HIDock — 键盘 ⌨️ + 触控板 👆"
 
         statusLabel = NSTextField(labelWithString: "初始化蓝牙…")
         statusLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        statusLabel.frame = NSRect(x: 20, y: 270, width: 420, height: 20)
+        statusLabel.frame = NSRect(x: 20, y: 480, width: 420, height: 20)
 
         logLabel = NSTextField(labelWithString: "")
         logLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         logLabel.textColor = .tertiaryLabelColor
-        logLabel.frame = NSRect(x: 20, y: 248, width: 420, height: 16)
+        logLabel.frame = NSRect(x: 20, y: 458, width: 420, height: 16)
 
-        captureView = CaptureView(frame: NSRect(x: 0, y: 0, width: 460, height: 240))
+        captureView = CaptureView(frame: NSRect(x: 0, y: 224, width: 460, height: 226))
+        trackpadView = TrackpadView(frame: NSRect(x: 0, y: 16, width: 460, height: 200))
+        trackpadView.onReport = { appDelegate.ble.sendMouseReport($0) }
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 320))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 520))
         container.addSubview(statusLabel)
         container.addSubview(logLabel)
         container.addSubview(captureView)
+        container.addSubview(trackpadView)
         window.contentView = container
         window.center()
         window.makeKeyAndOrderFront(nil)
