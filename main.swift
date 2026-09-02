@@ -436,24 +436,37 @@ final class CaptureView: NSView {
     }
 
     // ===== 键盘 =====
-    // Mac 中文输入法会把标点变成全角(,。/等),折回半角再查表
+    // Mac 中文输入法会把标点变成全角,折回半角再查表。
+    // FF01–FF5E 是全角 ASCII 区(,:?!等,减 0xFEE0 即半角);
+    // 。【】《》等是 CJK 专用标点,不在该区,单独查表
     private func normalizeFullWidth(_ c: Character) -> Character? {
         guard let scalar = c.unicodeScalars.first, (0xFF01...0xFF5E).contains(scalar.value) else { return nil }
         guard let ascii = Unicode.Scalar(scalar.value - 0xFEE0) else { return nil }
         return Character(ascii)
+    }
+    private let cjkPunctToAscii: [Character: Character] = [
+        "。": ".", "、": ",", "·": "`",
+        "【": "[", "】": "]", "「": "[", "」": "]",
+        "『": "[", "』": "]", "《": "<", "》": ">",
+        "\u{201C}": "\"", "\u{201D}": "\"", "\u{2018}": "'", "\u{2019}": "'",
+        "—": "-", "–": "-", "…": ".", "\u{FFE5}": "$",
+    ]
+    private func normalizePunct(_ c: Character) -> Character? {
+        if let n = normalizeFullWidth(c) { return n }
+        return cjkPunctToAscii[c]
     }
 
     private func usageFor(_ event: NSEvent) -> (UInt8, Bool)? {
         if let chars = event.characters {
             for c in chars {
                 if let (u, s) = charToUsage[c] { return (u, s) }
-                if let n = normalizeFullWidth(c), let (u, s) = charToUsage[n] { return (u, s) }
+                if let n = normalizePunct(c), let (u, s) = charToUsage[n] { return (u, s) }
             }
             if let u16 = chars.utf16.first, let u = functionKeyUsage(u16) { return (u, false) }
         }
         if let c = event.charactersIgnoringModifiers?.first {
             if let (u, s) = charToUsage[c] { return (u, s) }
-            if let n = normalizeFullWidth(c), let (u, s) = charToUsage[n] { return (u, s) }
+            if let n = normalizePunct(c), let (u, s) = charToUsage[n] { return (u, s) }
         }
         return nil
     }
