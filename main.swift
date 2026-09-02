@@ -177,6 +177,15 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     var onStatus: (String) -> Void = { _ in }
     var onCentralsChanged: (Int) -> Void = { _ in }
     private var setupStage = 0
+    // BLE 发送队列满时挂起的鼠标增量。updateValue 返回 false 那帧没发出去,
+    // 直接丢弃 = 丢事件(触控板卡顿的根源);攒起来等 isReady 再冲
+    private var pendButtons: UInt8 = 0
+    private var pendDx = 0, pendDy = 0, pendWheel = 0
+    private var queueFullCount = 0
+    // 指数退避:链路堵死时(isReady 空转、updateValue 秒败)继续压队列会把
+    // 键盘通道一起堵死;失败后冷却 12→200ms 再试,成功即复位
+    private var consecutiveFails = 0
+    private var nextAttempt = Date.distantPast
 
     override init() {
         super.init()
@@ -308,6 +317,9 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
         subscribedCentrals.removeValue(forKey: central.identifier)
         mouseSubscribedCentrals.removeValue(forKey: central.identifier)
+        // 断开时清挂起增量并解除退避,回连后从干净状态开始
+        pendDx = 0; pendDy = 0; pendWheel = 0
+        consecutiveFails = 0; nextAttempt = .distantPast
         onCentralsChanged(subscribedCentrals.count + mouseSubscribedCentrals.count)
         if subscribedCentrals.isEmpty && mouseSubscribedCentrals.isEmpty {
             onStatus("已断开,重新广播等待回连…")
@@ -316,11 +328,13 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        // 注意:这里不重置退避计数——失联时 isReady 会空转循环,反复归零会让
+        // 熔断(600 次)永远不触发。恢复由"发送成功"自行复位
         if !subscribedCentrals.isEmpty {
             _ = pm.updateValue(sharedKeyboard.lastReport, for: reportChar, onSubscribedCentrals: Array(subscribedCentrals.values))
         }
         if !mouseSubscribedCentrals.isEmpty {
-            _ = pm.updateValue(lastMouseReport, for: mouseReportChar, onSubscribedCentrals: Array(mouseSubscribedCentrals.values))
+            flushMouseReport()
         }
     }
     func sendReport(_ data: Data) {
@@ -329,20 +343,68 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
         NSLog("HIDock: [notify] %@ ok=%d", data.map { String(format: "%02X", $0) }.joined(), ok ? 1 : 0)
     }
     func sendMouseReport(_ data: Data) {
-        guard pm.state == .poweredOn, !mouseSubscribedCentrals.isEmpty, let rc = mouseReportChar else { return }
-        lastMouseReport = data
-        _ = pm.updateValue(data, for: rc, onSubscribedCentrals: Array(mouseSubscribedCentrals.values))
-        // 移动报文量大,只记录点击/滚动,避免日志刷屏
-        if data[0] != 0 || data[5] != 0 {
-            NSLog("HIDock: [mouse] %@", data.map { String(format: "%02X", $0) }.joined())
+        guard data.count == 6 else { return }
+        // 拆回增量,累进待发缓存(按钮是状态量,取最新)
+        pendButtons = data[0]
+        pendDx += Int(Int16(bitPattern: UInt16(data[1]) | (UInt16(data[2]) << 8)))
+        pendDy += Int(Int16(bitPattern: UInt16(data[3]) | (UInt16(data[4]) << 8)))
+        pendWheel += Int(Int8(bitPattern: data[5]))
+        flushMouseReport()
+    }
+    // 冲刷待发增量:updateValue 返回 false = 队列满没发出去,留在缓存等重试;
+    // 带指数退避,链路失联时不再压队列(否则键盘通道一起堵死)
+    @discardableResult
+    func flushMouseReport() -> Bool {
+        guard pm.state == .poweredOn, !mouseSubscribedCentrals.isEmpty, let rc = mouseReportChar,
+              pendButtons != 0 || pendDx != 0 || pendDy != 0 || pendWheel != 0 else { return false }
+        if Date() < nextAttempt { return false }
+        func le16(_ x: Int) -> [UInt8] {
+            let u = UInt16(bitPattern: Int16(clamping: x))
+            return [UInt8(u & 0xFF), UInt8(u >> 8)]
         }
+        // 挂起增量限幅,防长时间积压后一帧把手机指针甩到边缘
+        func cap(_ x: Int, _ m: Int) -> Int { min(max(x, -m), m) }
+        var d = Data([pendButtons])
+        d.append(contentsOf: le16(cap(pendDx, 2048)))
+        d.append(contentsOf: le16(cap(pendDy, 2048)))
+        d.append(UInt8(bitPattern: Int8(clamping: cap(pendWheel, 120))))
+        let ok = pm.updateValue(d, for: rc, onSubscribedCentrals: Array(mouseSubscribedCentrals.values))
+        if ok {
+            consecutiveFails = 0
+            lastMouseReport = d
+            pendDx = 0; pendDy = 0; pendWheel = 0
+            // 移动报文量大,只记录点击/滚动,避免日志刷屏
+            if d[0] != 0 || d[5] != 0 {
+                NSLog("HIDock: [mouse] %@", d.map { String(format: "%02X", $0) }.joined())
+            }
+        } else {
+            consecutiveFails += 1
+            queueFullCount += 1
+            nextAttempt = Date().addingTimeInterval(min(0.012 * pow(2, Double(min(consecutiveFails, 5))), 0.2))
+            // 熔断:持续堵死说明链路已失联(如手机息屏限流),陈年位移无意义,清掉防恢复时乱跳
+            if consecutiveFails == 600 {
+                pendDx = 0; pendDy = 0; pendWheel = 0
+                NSLog("HIDock: [mouse] 链路持续拥堵,丢弃缓存位移(按钮状态保留)")
+            }
+            if queueFullCount == 1 || queueFullCount % 200 == 0 {
+                NSLog("HIDock: [mouse] BLE 队列满 ×%d(退避重试中)", queueFullCount)
+            }
+        }
+        return ok
     }
 }
 
 // ---------- 手机面板:打字 + 触控板合一 ----------
-// 面板尺寸 = 小米 17 Ultra 机身 1:1(77.6mm × 162.9mm ≈ 220 × 462pt,1pt = 0.3528mm)
-let kPhoneW: CGFloat = 220
-let kPhoneH: CGFloat = 462
+
+// GitHub 入口图标(github/explore 的 octocat,32px PNG 内嵌,运行时零联网)
+let kGitHubMarkPNG = "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"
+
+func githubMarkImage() -> NSImage? {
+    guard let d = Data(base64Encoded: kGitHubMarkPNG) else { return nil }
+    let img = NSImage(data: d)
+    img?.isTemplate = true   // 走 alpha 通道,由按钮 contentTintColor 上色
+    return img
+}
 
 final class CaptureView: NSView {
     let kb = sharedKeyboard
