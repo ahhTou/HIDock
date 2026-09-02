@@ -471,13 +471,26 @@ final class CaptureView: NSView {
         return nil
     }
 
+    // ===== 指针捕获 / Cmd+Q =====
+    // Cmd+Q:捕获中 → 释放捕获;未捕获 → 退出应用。命中即吞掉,绝不透传给手机。
+    // performKeyEquivalent 优先接;本应用无菜单栏,事件最终也会走 keyDown,双保险
+    private func isCmdQ(_ e: NSEvent) -> Bool {
+        e.modifierFlags.contains(.command) && e.charactersIgnoringModifiers?.lowercased() == "q"
+    }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if isCmdQ(event) { appDelegate.cmdQPressed(); return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
     override func keyDown(with event: NSEvent) {
+        if isCmdQ(event) { appDelegate.cmdQPressed(); return }
         if let (u, s) = usageFor(event) {
             NSLog("HIDock: [key] down 0x%02X shift=%d", u, s ? 1 : 0)
             kb.keyDown(usage: u, shifted: s); appDelegate.logKey(u, down: true)
         }
     }
     override func keyUp(with event: NSEvent) {
+        if isCmdQ(event) { return }
         if let (u, s) = usageFor(event) { kb.keyUp(usage: u, shifted: s); appDelegate.logKey(u, down: false) }
     }
     override func flagsChanged(with event: NSEvent) {
@@ -550,6 +563,11 @@ final class CaptureView: NSView {
     }
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        // 点击面板才开始捕获;用于捕获的这次点击本身不算手机上的点击
+        if !appDelegate.pointerCaptured {
+            appDelegate.capturePointer()
+            return
+        }
         setButton(0x01, on: true)
     }
     override func mouseUp(with event: NSEvent) { setButton(0x01, on: false) }
@@ -572,6 +590,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let ble = BlePeripheral()
     var landscape = false
     static let toolbarH: CGFloat = 64
+    var pointerCaptured = false
+    private var grabPoint = NSPoint.zero
+    private var lastStatus = ""
+    // 失焦自动释放捕获时记录的"可自动恢复"期限(Cmd+Q 手动释放不设)
 
     var kb: HidKeyboard { sharedKeyboard }
     func logKey(_ u: UInt8, down: Bool) {
@@ -579,6 +601,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.logLabel.stringValue = String(format: "%@ usage=0x%02X", down ? "↓" : "↑", u)
         }
     }
+    // ===== 指针捕获 =====
+    // 冻结系统光标(CGAssociateMouseAndMouseCursorPosition,游戏/远程桌面同款):
+    // 光标停在进入点不再移动,物理位移继续以 deltaX/Y 事件送进来,滑多远都出不了面板
+    func capturePointer() {
+        guard !pointerCaptured else { return }
+        pointerCaptured = true
+        grabPoint = NSEvent.mouseLocation
+        CGAssociateMouseAndMouseCursorPosition(0)
+        NSCursor.hide()
+        statusLabel.stringValue = "指针已捕获 · ⌘Q 释放"
+        statusDot.layer?.backgroundColor = NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 1).cgColor
+        phonePanel.needsDisplay = true
+        NSLog("HIDock: [capture] on")
+    }
+    func releasePointer(recapture: Bool = false) {
+        guard pointerCaptured else { return }
+        pointerCaptured = false
+        CGAssociateMouseAndMouseCursorPosition(1)
+        NSCursor.unhide()
+        // 释放后把光标挪到面板上方的工具栏一带,别留在面板里:
+        // 留在里面的话悬停仍会带动手机光标,还得再挪一步才真正"脱离";
+        // 同时也避免重关联瞬间系统把冻结期间累积的位移一次性倒出来。
+        // AppKit 全局坐标(原点左下)→ CG(原点左上)需要翻 Y
+        let f = window.frame
+        let tx = min(max(grabPoint.x, f.minX + 20), f.maxX - 20)
+        let ty = f.maxY - 50
+        let h = NSScreen.screens.first?.frame.height ?? 0
+        CGWarpMouseCursorPosition(CGPoint(x: tx, y: h - ty))
+        // 手动释放要顺手清掉残留的自动恢复期限,避免之后切窗被意外重新捕获
+        recaptureDeadline = recapture ? Date().addingTimeInterval(5) : .distantPast
+        statusLabel.stringValue = lastStatus
+        statusDot.layer?.backgroundColor = statusColor(lastStatus).cgColor
+        phonePanel.needsDisplay = true
+        NSLog("HIDock: [capture] off")
+    }
+    // Cmd+Q:捕获中 → 脱离;未捕获 → 退出。Cmd 按下时 flagsChanged 已把
+    // GUI 修饰位发去手机,这里补一帧空报文清掉,避免手机端 Meta 悬挂
+    @objc func cmdQPressed() {
+        if pointerCaptured {
+            releasePointer()
+        } else {
+            releasePointer()
+            NSApp.terminate(nil)
+        }
+        kb.modifiersChanged(0)
+    }
+    // Cmd+Tab 切走 / 系统弹窗抢焦点时自动放开,别把用户锁死在捕获里。
+    // 多指系统手势(四指上滑=Mission Control 等)抢走焦点也走这里,标记可恢复
+    @objc private func autoReleaseCapture(_ n: Notification) { releasePointer(recapture: true) }
+    // 5 秒内窗口重新拿到焦点:光标放回面板中心,自动恢复捕获,不用再点一次
+    @objc private func winBecameKey(_ n: Notification) {
+        guard Date() < recaptureDeadline, !pointerCaptured else { return }
+        recaptureDeadline = .distantPast
+        let f = phonePanel.frame
+        // convertToScreen 只收 NSRect,塞个零尺寸矩形取中点
+        let c = window.convertToScreen(NSRect(x: f.midX, y: f.midY, width: 0, height: 0)).origin
+        let h = NSScreen.screens.first?.frame.height ?? 0
+        CGWarpMouseCursorPosition(CGPoint(x: c.x, y: h - c.y))
+        capturePointer()
+    }
+
+    @objc func toggleTrackpad(_ sender: NSButton) {
+        phonePanel.trackpadEnabled.toggle()
+        sender.title = phonePanel.trackpadEnabled ? "触控板 开" : "触控板 关"
+    }
+    // 手机横竖屏只是状态记录:相对触控板的 delta 映射与朝向无关,窗口也不变
 
     @objc func toggleOrientation(_ sender: NSButton) {
         landscape.toggle()
@@ -655,6 +743,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         window.initialFirstResponder = phonePanel
         NSApp.activate(ignoringOtherApps: true)
+        // 捕获期间窗口失焦/应用失活 → 自动释放,防止用户被锁在捕获态;
+        // 短时间内切回来则自动恢复捕获(见 winBecameKey)
+        NotificationCenter.default.addObserver(self, selector: #selector(autoReleaseCapture),
+            name: NSWindow.didResignKeyNotification, object: window)
+        NotificationCenter.default.addObserver(self, selector: #selector(autoReleaseCapture),
+            name: NSApplication.didResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(winBecameKey),
+            name: NSWindow.didBecomeKeyNotification, object: window)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) { releasePointer() }
+
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
