@@ -425,14 +425,45 @@ final class CaptureView: NSView {
             owner: self, userInfo: nil))
     }
 
+    // 面板即状态:空闲 = 居中引导;捕获 = 蓝色描边 + 四角取景括号 + 底部 ⌘Q 徽标
     override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 28, yRadius: 28)
-        NSColor(calibratedWhite: 0.13, alpha: 1).setFill()
+        let captured = appDelegate?.pointerCaptured ?? false
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1.5, dy: 1.5), xRadius: 20, yRadius: 20)
+        NSColor(srgbRed: 0.110, green: 0.110, blue: 0.121, alpha: 1).setFill()
         path.fill()
-        let hint = "点按面板获得焦点后打字\n光标在面板上滑动 = 手机触控板\n单击=左键 · 右键=返回 · 双指滚动(修复中)"
-        (hint as NSString).draw(at: NSPoint(x: 14, y: bounds.height - 46),
-            withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
-                             .foregroundColor: NSColor.lightGray])
+        (captured ? NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 1)
+                  : NSColor(white: 0.23, alpha: 1)).setStroke()
+        path.lineWidth = captured ? 1.8 : 1
+        path.stroke()
+
+        func centered(_ s: String, font: NSFont, color: NSColor, cy: CGFloat) {
+            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+            let str = s as NSString
+            let sz = str.size(withAttributes: attrs)
+            str.draw(at: NSPoint(x: (bounds.width - sz.width) / 2, y: cy - sz.height / 2),
+                     withAttributes: attrs)
+        }
+        if captured {
+            let c = NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 0.9)
+            let L: CGFloat = 14
+            let b = bounds.insetBy(dx: 16, dy: 16)
+            func bracket(_ a: NSPoint, _ m: NSPoint, _ z: NSPoint) {
+                let p = NSBezierPath()
+                p.move(to: a); p.line(to: m); p.line(to: z)
+                c.setStroke(); p.lineWidth = 2; p.lineCapStyle = .round; p.stroke()
+            }
+            bracket(NSPoint(x: b.minX, y: b.minY + L), NSPoint(x: b.minX, y: b.minY), NSPoint(x: b.minX + L, y: b.minY))
+            bracket(NSPoint(x: b.maxX - L, y: b.minY), NSPoint(x: b.maxX, y: b.minY), NSPoint(x: b.maxX, y: b.minY + L))
+            bracket(NSPoint(x: b.maxX, y: b.maxY - L), NSPoint(x: b.maxX, y: b.maxY), NSPoint(x: b.maxX - L, y: b.maxY))
+            bracket(NSPoint(x: b.minX + L, y: b.maxY), NSPoint(x: b.minX, y: b.maxY), NSPoint(x: b.minX, y: b.maxY - L))
+            centered("已捕获 · ⌘Q 释放", font: .systemFont(ofSize: 10, weight: .medium),
+                     color: NSColor(srgbRed: 0.55, green: 0.71, blue: 1.0, alpha: 1), cy: 24)
+        } else {
+            centered("点击捕获指针", font: .systemFont(ofSize: 13, weight: .medium),
+                     color: NSColor(white: 0.92, alpha: 1), cy: bounds.height / 2 + 8)
+            centered("滑动控制手机 · 双指滚动 = 滚轮", font: .systemFont(ofSize: 9.5),
+                     color: NSColor(white: 0.60, alpha: 1), cy: bounds.height / 2 - 10)
+        }
     }
 
     // ===== 键盘 =====
@@ -577,23 +608,35 @@ final class CaptureView: NSView {
     override func otherMouseUp(with event: NSEvent) { setButton(0x04, on: false) }
 }
 
+
 // ---------- App ----------
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var container: NSView!
+    var statusDot: NSView!
     var statusLabel: NSTextField!
+    var hintLabel1: NSTextField!
+    var hintLabel2: NSTextField!
     var logLabel: NSTextField!
     var phonePanel: CaptureView!
     var orientButton: NSButton!
     var trackpadButton: NSButton!
-    var resetButton: NSButton!
+    var githubButton: NSButton!
     let ble = BlePeripheral()
+    // 手机横竖屏,纯状态记录:相对触控板的 delta 映射与朝向无关,窗口样式也不随之变化
     var landscape = false
-    static let toolbarH: CGFloat = 64
+    // 紧凑触控板尺寸(近 Magic Trackpad 比例)
+    static let padW: CGFloat = 380
+    static let padH: CGFloat = 212
+    static let margin: CGFloat = 12
+    static let headerH: CGFloat = 24
+    static let statusH: CGFloat = 18
+    static let footerH: CGFloat = 38
     var pointerCaptured = false
     private var grabPoint = NSPoint.zero
     private var lastStatus = ""
     // 失焦自动释放捕获时记录的"可自动恢复"期限(Cmd+Q 手动释放不设)
+    private var recaptureDeadline = Date.distantPast
 
     var kb: HidKeyboard { sharedKeyboard }
     func logKey(_ u: UInt8, down: Bool) {
@@ -601,6 +644,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.logLabel.stringValue = String(format: "%@ usage=0x%02X", down ? "↓" : "↑", u)
         }
     }
+
     // ===== 指针捕获 =====
     // 冻结系统光标(CGAssociateMouseAndMouseCursorPosition,游戏/远程桌面同款):
     // 光标停在进入点不再移动,物理位移继续以 deltaX/Y 事件送进来,滑多远都出不了面板
@@ -667,34 +711,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sender.title = phonePanel.trackpadEnabled ? "触控板 开" : "触控板 关"
     }
     // 手机横竖屏只是状态记录:相对触控板的 delta 映射与朝向无关,窗口也不变
-
     @objc func toggleOrientation(_ sender: NSButton) {
         landscape.toggle()
-        layoutWindow()
+        sender.title = landscape ? "手机横屏" : "手机竖屏"
     }
-    @objc func toggleTrackpad(_ sender: NSButton) {
-        phonePanel.trackpadEnabled.toggle()
-        sender.title = phonePanel.trackpadEnabled ? "触控板:开" : "触控板:关"
+    @objc func openGitHub(_ sender: NSButton) {
+        NSWorkspace.shared.open(URL(string: "https://github.com/ahhTou/HIDock")!)
     }
-    @objc func resetSize(_ sender: NSButton) { layoutWindow() }
 
-    // 按当前横竖方向重排:面板 1:1 真机尺寸,工具栏在上方
+    // 状态色:连接=绿 / 广播=琥珀 / 异常=红 / 其他=灰
+    private func statusColor(_ s: String) -> NSColor {
+        if s.contains("已连接") || s.contains("就绪") { return NSColor(srgbRed: 0.19, green: 0.64, blue: 0.42, alpha: 1) }
+        if s.contains("广播") { return NSColor(srgbRed: 0.96, green: 0.65, blue: 0.14, alpha: 1) }
+        if s.contains("未就绪") || s.contains("失败") { return NSColor(srgbRed: 0.90, green: 0.28, blue: 0.30, alpha: 1) }
+        return NSColor(white: 0.55, alpha: 1)
+    }
+
+    private func makeToolButton(_ title: String, _ action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .recessed
+        b.controlSize = .small
+        b.font = .systemFont(ofSize: 11)
+        b.setContentHuggingPriority(.required, for: .horizontal)
+        return b
+    }
+
+    // 红绿灯实际中线(窗口坐标)。成为 key window 后 AppKit 会异步重摆一次标准按钮,
+    // 跟系统抢位置会"闪一下又弹回去";正确做法是不动红绿灯,让工具按钮贴过去
+    private func lightCenterY() -> CGFloat? {
+        guard let close = window.standardWindowButton(.closeButton), let sv = close.superview else { return nil }
+        return sv.convert(NSPoint(x: close.frame.midX, y: close.frame.midY), to: nil).y
+    }
+
+    // 固定尺寸四段:按钮行(与红绿灯同带) / 状态独占一行 / 触控板表面 / 提示脚注
     func layoutWindow() {
-        let panelW = landscape ? kPhoneH : kPhoneW
-        let panelH = landscape ? kPhoneW : kPhoneH
-        let totalH = panelH + Self.toolbarH
-        container.frame = NSRect(x: 0, y: 0, width: panelW, height: totalH)
-        phonePanel.frame = NSRect(x: 0, y: 0, width: panelW, height: panelH)
-        statusLabel.frame = NSRect(x: 10, y: panelH + 44, width: panelW - 20, height: 16)
-        logLabel.frame = NSRect(x: 10, y: panelH + 28, width: panelW - 20, height: 14)
-        let bw: CGFloat = 64, gap: CGFloat = 8
-        let x0 = (panelW - (3 * bw + 2 * gap)) / 2
-        orientButton.frame = NSRect(x: x0, y: panelH + 2, width: bw, height: 22)
-        trackpadButton.frame = NSRect(x: x0 + bw + gap, y: panelH + 2, width: bw, height: 22)
-        resetButton.frame = NSRect(x: x0 + 2 * (bw + gap), y: panelH + 2, width: bw, height: 22)
-        orientButton.title = landscape ? "切竖屏" : "切横屏"
-        window.setContentSize(NSSize(width: panelW, height: totalH))
+        let M = Self.margin
+        let W = Self.padW + M * 2
+        let H = Self.padH + M * 2 + Self.headerH + Self.statusH + Self.footerH + 26
+        container.frame = NSRect(x: 0, y: 0, width: W, height: H)
+
+        // 第 1 行:工具按钮与红绿灯同中线(读系统实际位置;拿不到时退回标题栏中线)
+        let row1Center = lightCenterY() ?? (H - 14)
+        var bx = W - M
+        for b in [trackpadButton!, orientButton!] {
+            let w = ceil(b.fittingSize.width) + 10
+            bx -= w
+            b.frame = NSRect(x: bx, y: row1Center - 10, width: w, height: 20)
+            bx -= 8
+        }
+        // 第 2 行:当前状态独占一行,不再和按钮挤
+        let row2Y = H - M - Self.headerH - 8 - Self.statusH
+        statusDot.frame = NSRect(x: M, y: row2Y + 5, width: 8, height: 8)
+        statusLabel.frame = NSRect(x: M + 14, y: row2Y + 2, width: W - M * 2 - 14, height: 14)
+        phonePanel.frame = NSRect(x: M, y: M + Self.footerH + 10, width: Self.padW, height: Self.padH)
+        hintLabel1.frame = NSRect(x: M, y: M + 22, width: W - M * 2, height: 12)
+        hintLabel2.frame = NSRect(x: M, y: M + 8, width: W * 0.6, height: 12)
+        // 右下角:GitHub 入口(最右,圆形白底) + 键码小字(让出图标宽度)
+        githubButton.frame = NSRect(x: W - M - 20, y: M + 4, width: 20, height: 20)
+        logLabel.frame = NSRect(x: W * 0.6, y: M + 8, width: W - M - W * 0.6 - 28, height: 12)
+        orientButton.title = landscape ? "手机横屏" : "手机竖屏"
+        trackpadButton.title = phonePanel.trackpadEnabled ? "触控板 开" : "触控板 关"
+        window.setContentSize(NSSize(width: W, height: H))
         window.center()
+    }
+
+    // 成 key 后红绿灯会被系统重摆一次(仍是默认位置);重读一次中线、贴一次按钮,兜底
+    private func realignRow1ToLights() {
+        guard let c = lightCenterY() else { return }
+        for b in [trackpadButton!, orientButton!] { b.frame.origin.y = c - b.frame.height / 2 }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -702,7 +786,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sharedKeyboard.ble = ble
         ble.onStatus = { text in
             NSLog("HIDock: %@", text)
-            DispatchQueue.main.async { self.statusLabel.stringValue = text }
+            DispatchQueue.main.async {
+                self.lastStatus = text
+                if !self.pointerCaptured { self.statusLabel.stringValue = text }
+                self.statusDot.layer?.backgroundColor = self.statusColor(text).cgColor
+            }
         }
         ble.onCentralsChanged = { n in
             DispatchQueue.main.async {
@@ -710,39 +798,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: kPhoneW, height: kPhoneH + Self.toolbarH),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
+        // 透明标题栏 + fullSizeContentView:原生红绿灯/圆角/阴影/标题栏拖动全保留,
+        // 内容铺满窗口,视觉上等同无边框;绿色缩放键对固定尺寸工具无意义,隐藏
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: Self.padW + Self.margin * 2,
+                                             height: Self.padH + Self.margin * 2 + Self.headerH + Self.statusH + Self.footerH + 26),
+                          styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
-        window.title = "HIDock — 手机面板"
+        window.title = "HIDock"
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.appearance = NSAppearance(named: .darkAqua)   // 工具统一深色,不随系统主题漂移
+        window.backgroundColor = NSColor(srgbRed: 0.055, green: 0.055, blue: 0.063, alpha: 1)
+        window.isMovableByWindowBackground = true            // 标题栏条 + 空白处都可拖动
+        window.standardWindowButton(.zoomButton)?.isHidden = true
 
-        container = NSView(frame: NSRect(x: 0, y: 0, width: kPhoneW, height: kPhoneH + Self.toolbarH))
+        container = NSView(frame: .zero)
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor(srgbRed: 0.055, green: 0.055, blue: 0.063, alpha: 1).cgColor
+
+        statusDot = NSView(frame: NSRect(x: 0, y: 0, width: 8, height: 8))
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 4
+        statusDot.layer?.backgroundColor = NSColor(white: 0.55, alpha: 1).cgColor
+
         statusLabel = NSTextField(labelWithString: "初始化蓝牙…")
         statusLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        logLabel = NSTextField(labelWithString: "")
-        logLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        logLabel.textColor = .tertiaryLabelColor
+        statusLabel.textColor = NSColor(white: 0.92, alpha: 1)
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.cell?.truncatesLastVisibleLine = true
+        statusLabel.cell?.wraps = false
 
-        phonePanel = CaptureView(frame: NSRect(x: 0, y: 0, width: kPhoneW, height: kPhoneH))
+        hintLabel1 = NSTextField(labelWithString: "单击 = 左键 · 右键 = 返回 · 双指滚动 = 滚轮")
+        hintLabel2 = NSTextField(labelWithString: "点击面板捕获指针 · 按住空白处拖动 · ⌘Q 退出")
+        for h in [hintLabel1!, hintLabel2!] {
+            h.font = .systemFont(ofSize: 9.5)
+            h.textColor = NSColor(white: 0.50, alpha: 1)
+        }
+
+        logLabel = NSTextField(labelWithString: "")
+        logLabel.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
+        logLabel.textColor = NSColor(white: 0.40, alpha: 1)
+        logLabel.alignment = .right
+
+        phonePanel = CaptureView(frame: NSRect(x: 0, y: 0, width: Self.padW, height: Self.padH))
         phonePanel.onMouseReport = { appDelegate.ble.sendMouseReport($0) }
 
-        orientButton = NSButton(title: "切横屏", target: self, action: #selector(toggleOrientation(_:)))
-        trackpadButton = NSButton(title: "触控板:开", target: self, action: #selector(toggleTrackpad(_:)))
-        resetButton = NSButton(title: "1:1 大小", target: self, action: #selector(resetSize(_:)))
-        orientButton.bezelStyle = .rounded
-        trackpadButton.bezelStyle = .rounded
-        resetButton.bezelStyle = .rounded
+        orientButton = makeToolButton("手机竖屏", #selector(toggleOrientation(_:)))
+        trackpadButton = makeToolButton("触控板 开", #selector(toggleTrackpad(_:)))
 
+        githubButton = NSButton(title: "", target: self, action: #selector(openGitHub(_:)))
+        if let mark = githubMarkImage() {
+            mark.size = NSSize(width: 12, height: 12)   // 图标在 20pt 圆内留边,不顶满
+            githubButton.image = mark
+        }
+        githubButton.imagePosition = .imageOnly
+        githubButton.imageScaling = .scaleProportionallyDown
+        githubButton.isBordered = false
+        githubButton.contentTintColor = NSColor(srgbRed: 0.14, green: 0.16, blue: 0.18, alpha: 1)  // GitHub 品牌深灰
+        githubButton.toolTip = "GitHub · ahhTou/HIDock"
+        // 圆形白底,图标居中
+        githubButton.wantsLayer = true
+        githubButton.layer?.backgroundColor = NSColor.white.cgColor
+        githubButton.layer?.cornerRadius = 10
+        githubButton.layer?.masksToBounds = true
+
+        container.addSubview(statusDot)
         container.addSubview(statusLabel)
+        container.addSubview(hintLabel1)
+        container.addSubview(hintLabel2)
         container.addSubview(logLabel)
+        container.addSubview(githubButton)
         container.addSubview(orientButton)
         container.addSubview(trackpadButton)
-        container.addSubview(resetButton)
         container.addSubview(phonePanel)
         window.contentView = container
         layoutWindow()
         window.makeKeyAndOrderFront(nil)
+        realignRow1ToLights()   // 系统重摆红绿灯后兜底再贴一次(幂等)
         window.initialFirstResponder = phonePanel
         NSApp.activate(ignoringOtherApps: true)
+
         // 捕获期间窗口失焦/应用失活 → 自动释放,防止用户被锁在捕获态;
         // 短时间内切回来则自动恢复捕获(见 winBecameKey)
         NotificationCenter.default.addObserver(self, selector: #selector(autoReleaseCapture),
@@ -754,8 +889,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) { releasePointer() }
-
-    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
