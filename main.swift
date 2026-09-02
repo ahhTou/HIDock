@@ -417,20 +417,26 @@ final class CaptureView: NSView {
               event.deltaX, event.deltaY, event.scrollingDeltaY, event.momentumPhase.rawValue)
     }
 
-    // 8ms 节流合帧:事件来太密时累加增量,别把 BLE 队列打爆
+    // 12ms 节流合帧(~83Hz):BLE 链路常态容量撑不起 125Hz,留余量防队列饱和
     private func enqueue(dx: Int, dy: Int, wheel: Int = 0, force: Bool = false) {
         guard trackpadEnabled else { return }
         pendingDx += dx; pendingDy += dy; pendingWheel += wheel
-        guard force || mButtons != 0 || Date().timeIntervalSince(lastSent) >= 0.008 else { return }
+        guard force || mButtons != 0 || Date().timeIntervalSince(lastSent) >= 0.012 else { return }
         guard force || pendingDx != 0 || pendingDy != 0 || pendingWheel != 0 else { return }
         func le16(_ x: Int) -> [UInt8] {
             let u = UInt16(bitPattern: Int16(clamping: x))
             return [UInt8(u & 0xFF), UInt8(u >> 8)]
         }
+        // 单帧位移上限:三指拖移这类多指手势会吐出巨大的 delta,一帧把手机指针
+        // 甩到屏幕边缘会触发安卓系统手势(下拉通知栏/边缘返回),打断手机正在
+        // 进行的播报/操作;超限部分直接丢弃,兼作限速
+        func cap(_ x: Int, _ m: Int) -> Int { min(max(x, -m), m) }
         var d = Data([mButtons])
-        d.append(contentsOf: le16(pendingDx))
-        d.append(contentsOf: le16(pendingDy))
-        d.append(UInt8(Int8(clamping: pendingWheel)))
+        d.append(contentsOf: le16(cap(pendingDx, 1024)))
+        d.append(contentsOf: le16(cap(pendingDy, 1024)))
+        // 滚轮字节要的是 Int8 的补码重解释。曾写成 UInt8(Int8(...)):那是陷阱式
+        // 初始化器,值为负直接 EXC_BREAKPOINT —— 滚轮路径历史崩溃的真正根源
+        d.append(UInt8(bitPattern: Int8(clamping: cap(pendingWheel, 60))))
         onMouseReport?(d)
         pendingDx = 0; pendingDy = 0; pendingWheel = 0
         lastSent = Date()
@@ -455,8 +461,12 @@ final class CaptureView: NSView {
     }
     override func scrollWheel(with event: NSEvent) {
         moveLog("scroll", event)
-        // 滚轮路径曾两次在 enqueue 内 EXC_BREAKPOINT 崩溃,停用排查中
-        return
+        // 双指滚动 → 手机滚轮(仅纵向;横向要动 Report Map,会让已配对手机的缓存失效,不做)。
+        // 此路径当年 EXC_BREAKPOINT 的根源:直接 Int(scrollingDeltaY) 遇到 NaN/inf 是运行时陷阱,
+        // 统一走 clampDelta 防御即可。方向反了就翻符号
+        let dy = CaptureView.clampDelta(event.scrollingDeltaY)
+        guard dy != 0 else { return }
+        enqueue(dx: 0, dy: 0, wheel: -dy)
     }
 
     private func setButton(_ bit: UInt8, on: Bool) {
