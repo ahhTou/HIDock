@@ -122,13 +122,20 @@ func functionKeyUsage(_ u: UInt16) -> UInt8? {
 
 // ---------- 键盘状态机 ----------
 final class HidKeyboard {
-    var modifier: UInt8 = 0
+    // 修饰键字节 = 物理修饰键(flagsChanged 实时状态)∪ 按住中的"需 Shift 字符键",
+    // 报文现算。旧实现让 keyDown/keyUp 按"字符要不要 Shift"直接翻转 Shift 位:
+    // Shift↓1↓、Shift 先松、1 后松 时,1 还按着但 Shift 位已被清,手机 key repeat
+    // 漏出一串小写 1(Shift 组合键异常的根源);两个来源各写各的,时序一错就打架
+    private var physicalMods: UInt8 = 0
+    private var shiftedHeld = Set<UInt8>()
     var keys: [UInt8] = []
     var lastReport = Data(repeating: 0, count: 8)
     var ble: BlePeripheral?
 
     func report() -> Data {
-        var d = Data([modifier, 0])
+        var m = physicalMods
+        if keys.contains(where: { shiftedHeld.contains($0) }) { m |= 0x02 }
+        var d = Data([m, 0])
         for k in keys.prefix(6) { d.append(k) }
         while d.count < 8 { d.append(0) }
         lastReport = d
@@ -138,17 +145,17 @@ final class HidKeyboard {
     func send() { ble?.sendReport(report()) }
 
     func keyDown(usage: UInt8, shifted: Bool) {
-        if shifted { modifier |= 0x02 }
+        if shifted { shiftedHeld.insert(usage) }
         if !keys.contains(usage) && keys.count < 6 { keys.append(usage) }
         send()
     }
-    func keyUp(usage: UInt8, shifted: Bool) {
+    func keyUp(usage: UInt8) {
         if let i = keys.firstIndex(of: usage) { keys.remove(at: i) }
-        if shifted { modifier &= ~0x02 }
+        shiftedHeld.remove(usage)
         send()
     }
     func modifiersChanged(_ m: UInt8) {
-        modifier = m
+        physicalMods = m
         send()
     }
     static func modifierBits(_ f: NSEvent.ModifierFlags) -> UInt8 {
@@ -181,7 +188,12 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     // 直接丢弃 = 丢事件(触控板卡顿的根源);攒起来等 isReady 再冲
     private var pendButtons: UInt8 = 0
     private var pendDx = 0, pendDy = 0, pendWheel = 0
+    // 有未发送的鼠标报文。判空必须用这个标志而不是"内容非零":
+    // 按钮松开的报文是全零(按钮0+位移0+滚轮0),内容判空会把松开吞掉,
+    // 手机永远收不到抬起 → 单击变长按
+    private var pendDirty = false
     private var queueFullCount = 0
+    private var lastSentButtons: UInt8 = 0  // 仅日志用:识别按钮按下/松开的跳变
     // 指数退避:链路堵死时(isReady 空转、updateValue 秒败)继续压队列会把
     // 键盘通道一起堵死;失败后冷却 12→200ms 再试,成功即复位
     private var consecutiveFails = 0
@@ -349,6 +361,7 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
         pendDx += Int(Int16(bitPattern: UInt16(data[1]) | (UInt16(data[2]) << 8)))
         pendDy += Int(Int16(bitPattern: UInt16(data[3]) | (UInt16(data[4]) << 8)))
         pendWheel += Int(Int8(bitPattern: data[5]))
+        pendDirty = true
         flushMouseReport()
     }
     // 冲刷待发增量:updateValue 返回 false = 队列满没发出去,留在缓存等重试;
@@ -356,7 +369,7 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     @discardableResult
     func flushMouseReport() -> Bool {
         guard pm.state == .poweredOn, !mouseSubscribedCentrals.isEmpty, let rc = mouseReportChar,
-              pendButtons != 0 || pendDx != 0 || pendDy != 0 || pendWheel != 0 else { return false }
+              pendDirty else { return false }
         if Date() < nextAttempt { return false }
         func le16(_ x: Int) -> [UInt8] {
             let u = UInt16(bitPattern: Int16(clamping: x))
@@ -373,9 +386,12 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
             consecutiveFails = 0
             lastMouseReport = d
             pendDx = 0; pendDy = 0; pendWheel = 0
-            // 移动报文量大,只记录点击/滚动,避免日志刷屏
-            if d[0] != 0 || d[5] != 0 {
+            pendDirty = false
+            // 移动报文量大,只记录按钮变化/滚动,避免日志刷屏
+            // (松开是全零报文,不看按钮变化会把它漏掉,还以为没发出去)
+            if d[0] != lastSentButtons || d[5] != 0 {
                 NSLog("HIDock: [mouse] %@", d.map { String(format: "%02X", $0) }.joined())
+                lastSentButtons = d[0]
             }
         } else {
             consecutiveFails += 1
@@ -493,7 +509,11 @@ final class CaptureView: NSView {
                 if let (u, s) = charToUsage[c] { return (u, s) }
                 if let n = normalizePunct(c), let (u, s) = charToUsage[n] { return (u, s) }
             }
-            if let u16 = chars.utf16.first, let u = functionKeyUsage(u16) { return (u, false) }
+            // Ctrl+字母 的 characters 是 0x01–0x1A 控制符,会撞上小键盘 Enter 的
+            // 0x03 映射(Ctrl+C 变 Ctrl+Enter);Ctrl 按住时不走功能键表,落到
+            // charactersIgnoringModifiers 取字母本体
+            if let u16 = chars.utf16.first, let u = functionKeyUsage(u16),
+               !(u16 == 0x03 && event.modifierFlags.contains(.control)) { return (u, false) }
         }
         if let c = event.charactersIgnoringModifiers?.first {
             if let (u, s) = charToUsage[c] { return (u, s) }
@@ -522,7 +542,8 @@ final class CaptureView: NSView {
     }
     override func keyUp(with event: NSEvent) {
         if isCmdQ(event) { return }
-        if let (u, s) = usageFor(event) { kb.keyUp(usage: u, shifted: s); appDelegate.logKey(u, down: false) }
+        // 同一物理键的按下/松开字符可能不同(Shift 先松等),但映射到同一 usage,移除是稳的
+        if let (u, _) = usageFor(event) { kb.keyUp(usage: u); appDelegate.logKey(u, down: false) }
     }
     override func flagsChanged(with event: NSEvent) {
         kb.modifiersChanged(HidKeyboard.modifierBits(event.modifierFlags))
@@ -590,6 +611,7 @@ final class CaptureView: NSView {
 
     private func setButton(_ bit: UInt8, on: Bool) {
         if on { mButtons |= bit } else { mButtons &= ~bit }
+        NSLog("HIDock: [mouse] btn 0x%02X %@", bit, on ? "down" : "up")
         enqueue(dx: 0, dy: 0, force: true)
     }
     override func mouseDown(with event: NSEvent) {
