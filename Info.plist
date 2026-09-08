@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>HIDock</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.ahhtou.hidock</string>
+	<key>CFBundleName</key>
+	<string>HIDock</string>
+	<key>CFBundleDisplayName</key>
+	<string>HIDock</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<!-- 蓝牙权限弹窗显示的就是这句话;裸二进制没有它,弹窗归属混乱且权限易失效 -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>HIDock 通过蓝牙把这台 Mac 变成手机的键盘和触控板。</string>
+</dict>
+</plist>

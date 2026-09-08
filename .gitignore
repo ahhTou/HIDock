@@ -1,6 +1,9 @@
 HIDock
+docky
 probe
 scanner
 app.log
 *.xcodeproj
 .DS_Store
+build/
+dist/

@@ -28,6 +28,7 @@ let manufacturerUUID    = CBUUID(string: "00002A29-0000-1000-8000-00805F9B34FB")
 let modelNumberUUID     = CBUUID(string: "00002A24-0000-1000-8000-00805F9B34FB")
 
 // 标准键盘 report map:Report ID 1 = modifier(1B) + 保留(1B) + 键(6B)
+// 追加鼠标 report map:Report ID 2 = 按键(1B) + X/Y 相对位移(各2B) + 滚轮(1B)
 let reportMapData = Data([
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x06,       // Usage (Keyboard)
@@ -44,7 +45,33 @@ let reportMapData = Data([
     0x15, 0x00, 0x25, 0x65,  //   Logical Min/Max (keycodes)
     0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
     0x81, 0x00,       //   Input (Data, Array)
-    0xC0              // End Collection
+    0xC0,             // End Collection (Keyboard)
+
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x02,       // Usage (Mouse)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, 0x02,       //   Report ID (2)
+    0x09, 0x01,       //   Usage (Pointer)
+    0xA1, 0x00,       //   Collection (Physical)
+    0x05, 0x09,       //     Usage Page (Buttons)
+    0x19, 0x01, 0x29, 0x03,  //   Buttons 1–3
+    0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x03,
+    0x81, 0x02,       //     Input (Data, Var, Abs)
+    0x75, 0x05, 0x95, 0x01,
+    0x81, 0x01,       //     Input (Const) — 5bit 填充
+    0x05, 0x01,       //     Usage Page (Generic Desktop)
+    0x09, 0x30, 0x09, 0x31,  //   Usage X / Y
+    0x16, 0x01, 0x80, //     Logical Min (-32767)
+    0x26, 0xFF, 0x7F, //     Logical Max (32767)
+    0x75, 0x10, 0x95, 0x02,
+    0x81, 0x06,       //     Input (Data, Var, Rel)
+    0x09, 0x38,       //     Usage (Wheel)
+    0x15, 0x81, 0x25, 0x7F,  //   Logical Min/Max (-127/127)
+    0x75, 0x08, 0x95, 0x01,
+    0x81, 0x06,       //     Input (Data, Var, Rel)
+    0xC0,             //   End Collection (Physical)
+    0xC0              // End Collection (Mouse)
 ])
 
 // ---------- 键码映射 ----------
@@ -141,12 +168,24 @@ let sharedKeyboard = HidKeyboard()
 final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     var pm: CBPeripheralManager!
     var reportChar: CBMutableCharacteristic!
+    var mouseReportChar: CBMutableCharacteristic!
     var protocolModeChar: CBMutableCharacteristic!
     var subscribedCentrals: [UUID: CBCentral] = [:]
+    var mouseSubscribedCentrals: [UUID: CBCentral] = [:]
+    var lastMouseReport = Data(repeating: 0, count: 6)
     var authedCentrals = Set<UUID>()
     var onStatus: (String) -> Void = { _ in }
     var onCentralsChanged: (Int) -> Void = { _ in }
     private var setupStage = 0
+    // BLE 发送队列满时挂起的鼠标增量。updateValue 返回 false 那帧没发出去,
+    // 直接丢弃 = 丢事件(触控板卡顿的根源);攒起来等 isReady 再冲
+    private var pendButtons: UInt8 = 0
+    private var pendDx = 0, pendDy = 0, pendWheel = 0
+    private var queueFullCount = 0
+    // 指数退避:链路堵死时(isReady 空转、updateValue 秒败)继续压队列会把
+    // 键盘通道一起堵死;失败后冷却 12→200ms 再试,成功即复位
+    private var consecutiveFails = 0
+    private var nextAttempt = Date.distantPast
 
     override init() {
         super.init()
@@ -177,6 +216,12 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
                                                  value: nil, permissions: reportPerms)
             reportChar.descriptors = [reportRef]
 
+            // 鼠标 Report(Report ID 2):与键盘 Report 同 UUID、不同实例,各自挂 2908 描述符
+            let mouseRef = CBMutableDescriptor(type: reportRefDescUUID, value: Data([0x02, 0x01])) // Report ID 2, Input
+            mouseReportChar = CBMutableCharacteristic(type: reportUUID, properties: [.read, .notify],
+                                                      value: nil, permissions: reportPerms)
+            mouseReportChar.descriptors = [mouseRef]
+
             let hidInfo = CBMutableCharacteristic(type: hidInfoUUID, properties: .read,
                 value: Data([0x11, 0x01, 0x02]), permissions: [.readable])  // HID 1.1, normally connectable
             let reportMap = CBMutableCharacteristic(type: reportMapUUID, properties: .read,
@@ -188,7 +233,7 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
                 value: nil, permissions: [.readable, .writeable])  // 1 = Report Protocol
 
             let hid = CBMutableService(type: hidServiceUUID, primary: true)
-            hid.characteristics = [hidInfo, reportMap, controlPoint, protocolModeChar, reportChar]
+            hid.characteristics = [hidInfo, reportMap, controlPoint, protocolModeChar, reportChar, mouseReportChar]
             pm.add(hid)
         default:
             startAdv()
@@ -229,18 +274,23 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
             request.value = data.subdata(in: request.offset..<data.count)
             peripheral.respond(to: request, withResult: .success)
         }
-        switch c.uuid {
+        // 两个 Report 特征同 UUID,按实例区分
+        if c === reportChar {
+            serve(sharedKeyboard.lastReport)
+        } else if c === mouseReportChar {
+            serve(lastMouseReport)
+        } else { switch c.uuid {
         case reportMapUUID:
             // 不设认证门槛:安卓 GATT 发现阶段读到 insufficientAuthentication 会放弃 HID 服务,
             // 转而按残余服务把设备归为穿戴设备("识别成手表"的根源),明文返回即可
             serve(reportMapData)
         case hidInfoUUID:      serve(Data([0x11, 0x01, 0x02]))
         case protocolModeUUID: serve(Data([0x01]))
-        case reportUUID:       serve(sharedKeyboard.lastReport)
         case batteryLevelUUID: serve(Data([100]))
         case manufacturerUUID: serve(Data("ZCode".utf8))
         case modelNumberUUID:  serve(Data("HIDock-手搓版".utf8))
         default: peripheral.respond(to: request, withResult: .readNotPermitted)
+        }
         }
     }
 
@@ -254,89 +304,339 @@ final class BlePeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
-        guard characteristic.uuid == reportUUID else { return }
-        subscribedCentrals[central.identifier] = central
-        onCentralsChanged(subscribedCentrals.count)
-        onStatus("已连接 ✓ 现在在窗口里打字即可上手机")
+        if characteristic === mouseReportChar {
+            mouseSubscribedCentrals[central.identifier] = central
+            onStatus("鼠标通道就绪 ✓ 窗口下方触控板区域可用")
+        } else if characteristic.uuid == reportUUID {
+            subscribedCentrals[central.identifier] = central
+            onStatus("已连接 ✓ 现在在窗口里打字即可上手机")
+        }
+        onCentralsChanged(subscribedCentrals.count + mouseSubscribedCentrals.count)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
         subscribedCentrals.removeValue(forKey: central.identifier)
-        onCentralsChanged(subscribedCentrals.count)
-        if subscribedCentrals.isEmpty {
+        mouseSubscribedCentrals.removeValue(forKey: central.identifier)
+        // 断开时清挂起增量并解除退避,回连后从干净状态开始
+        pendDx = 0; pendDy = 0; pendWheel = 0
+        consecutiveFails = 0; nextAttempt = .distantPast
+        onCentralsChanged(subscribedCentrals.count + mouseSubscribedCentrals.count)
+        if subscribedCentrals.isEmpty && mouseSubscribedCentrals.isEmpty {
             onStatus("已断开,重新广播等待回连…")
             if !pm.isAdvertising { startAdv() }
         }
     }
 
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
-        _ = pm.updateValue(sharedKeyboard.lastReport, for: reportChar, onSubscribedCentrals: Array(subscribedCentrals.values))
+        // 注意:这里不重置退避计数——失联时 isReady 会空转循环,反复归零会让
+        // 熔断(600 次)永远不触发。恢复由"发送成功"自行复位
+        if !subscribedCentrals.isEmpty {
+            _ = pm.updateValue(sharedKeyboard.lastReport, for: reportChar, onSubscribedCentrals: Array(subscribedCentrals.values))
+        }
+        if !mouseSubscribedCentrals.isEmpty {
+            flushMouseReport()
+        }
     }
     func sendReport(_ data: Data) {
         guard pm.state == .poweredOn, !subscribedCentrals.isEmpty, let rc = reportChar else { return }
         let ok = pm.updateValue(data, for: rc, onSubscribedCentrals: Array(subscribedCentrals.values))
         NSLog("HIDock: [notify] %@ ok=%d", data.map { String(format: "%02X", $0) }.joined(), ok ? 1 : 0)
     }
+    func sendMouseReport(_ data: Data) {
+        guard data.count == 6 else { return }
+        // 拆回增量,累进待发缓存(按钮是状态量,取最新)
+        pendButtons = data[0]
+        pendDx += Int(Int16(bitPattern: UInt16(data[1]) | (UInt16(data[2]) << 8)))
+        pendDy += Int(Int16(bitPattern: UInt16(data[3]) | (UInt16(data[4]) << 8)))
+        pendWheel += Int(Int8(bitPattern: data[5]))
+        flushMouseReport()
+    }
+    // 冲刷待发增量:updateValue 返回 false = 队列满没发出去,留在缓存等重试;
+    // 带指数退避,链路失联时不再压队列(否则键盘通道一起堵死)
+    @discardableResult
+    func flushMouseReport() -> Bool {
+        guard pm.state == .poweredOn, !mouseSubscribedCentrals.isEmpty, let rc = mouseReportChar,
+              pendButtons != 0 || pendDx != 0 || pendDy != 0 || pendWheel != 0 else { return false }
+        if Date() < nextAttempt { return false }
+        func le16(_ x: Int) -> [UInt8] {
+            let u = UInt16(bitPattern: Int16(clamping: x))
+            return [UInt8(u & 0xFF), UInt8(u >> 8)]
+        }
+        // 挂起增量限幅,防长时间积压后一帧把手机指针甩到边缘
+        func cap(_ x: Int, _ m: Int) -> Int { min(max(x, -m), m) }
+        var d = Data([pendButtons])
+        d.append(contentsOf: le16(cap(pendDx, 2048)))
+        d.append(contentsOf: le16(cap(pendDy, 2048)))
+        d.append(UInt8(bitPattern: Int8(clamping: cap(pendWheel, 120))))
+        let ok = pm.updateValue(d, for: rc, onSubscribedCentrals: Array(mouseSubscribedCentrals.values))
+        if ok {
+            consecutiveFails = 0
+            lastMouseReport = d
+            pendDx = 0; pendDy = 0; pendWheel = 0
+            // 移动报文量大,只记录点击/滚动,避免日志刷屏
+            if d[0] != 0 || d[5] != 0 {
+                NSLog("HIDock: [mouse] %@", d.map { String(format: "%02X", $0) }.joined())
+            }
+        } else {
+            consecutiveFails += 1
+            queueFullCount += 1
+            nextAttempt = Date().addingTimeInterval(min(0.012 * pow(2, Double(min(consecutiveFails, 5))), 0.2))
+            // 熔断:持续堵死说明链路已失联(如手机息屏限流),陈年位移无意义,清掉防恢复时乱跳
+            if consecutiveFails == 600 {
+                pendDx = 0; pendDy = 0; pendWheel = 0
+                NSLog("HIDock: [mouse] 链路持续拥堵,丢弃缓存位移(按钮状态保留)")
+            }
+            if queueFullCount == 1 || queueFullCount % 200 == 0 {
+                NSLog("HIDock: [mouse] BLE 队列满 ×%d(退避重试中)", queueFullCount)
+            }
+        }
+        return ok
+    }
 }
 
-// ---------- 捕获按键的视图 ----------
+// ---------- 手机面板:打字 + 触控板合一 ----------
+
+// GitHub 入口图标(github/explore 的 octocat,32px PNG 内嵌,运行时零联网)
+let kGitHubMarkPNG = "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"
+
+func githubMarkImage() -> NSImage? {
+    guard let d = Data(base64Encoded: kGitHubMarkPNG) else { return nil }
+    let img = NSImage(data: d)
+    img?.isTemplate = true   // 走 alpha 通道,由按钮 contentTintColor 上色
+    return img
+}
+
 final class CaptureView: NSView {
     let kb = sharedKeyboard
+    var onMouseReport: ((Data) -> Void)?
+    var trackpadEnabled = true
+    private var mButtons: UInt8 = 0
+    private var pendingDx = 0, pendingDy = 0, pendingWheel = 0
+    private var lastSent = Date.distantPast
+    private var lastMoveLog = Date.distantPast
+
     override var acceptsFirstResponder: Bool { true }
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
-        bounds.fill()
-        let hint = "① 手机蓝牙设置 → 配对 \"HIDock\"\n② 点一下本区域,打字即实时发送到手机\n(英文/数字/符号/回车退格方向键均支持;中文见 README)"
-        (hint as NSString).draw(at: NSPoint(x: 20, y: bounds.height - 60),
-            withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                             .foregroundColor: NSColor.secondaryLabelColor])
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for t in trackingAreas { removeTrackingArea(t) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseMoved, .activeInKeyWindow, .enabledDuringMouseDrag],
+            owner: self, userInfo: nil))
     }
 
-    // Mac 中文输入法会把标点变成全角(，。／等),折回半角再查表
+    // 面板即状态:空闲 = 居中引导;捕获 = 蓝色描边 + 四角取景括号 + 底部 ⌘Q 徽标
+    override func draw(_ dirtyRect: NSRect) {
+        let captured = appDelegate?.pointerCaptured ?? false
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1.5, dy: 1.5), xRadius: 20, yRadius: 20)
+        NSColor(srgbRed: 0.110, green: 0.110, blue: 0.121, alpha: 1).setFill()
+        path.fill()
+        (captured ? NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 1)
+                  : NSColor(white: 0.23, alpha: 1)).setStroke()
+        path.lineWidth = captured ? 1.8 : 1
+        path.stroke()
+
+        func centered(_ s: String, font: NSFont, color: NSColor, cy: CGFloat) {
+            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+            let str = s as NSString
+            let sz = str.size(withAttributes: attrs)
+            str.draw(at: NSPoint(x: (bounds.width - sz.width) / 2, y: cy - sz.height / 2),
+                     withAttributes: attrs)
+        }
+        if captured {
+            let c = NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 0.9)
+            let L: CGFloat = 14
+            let b = bounds.insetBy(dx: 16, dy: 16)
+            func bracket(_ a: NSPoint, _ m: NSPoint, _ z: NSPoint) {
+                let p = NSBezierPath()
+                p.move(to: a); p.line(to: m); p.line(to: z)
+                c.setStroke(); p.lineWidth = 2; p.lineCapStyle = .round; p.stroke()
+            }
+            bracket(NSPoint(x: b.minX, y: b.minY + L), NSPoint(x: b.minX, y: b.minY), NSPoint(x: b.minX + L, y: b.minY))
+            bracket(NSPoint(x: b.maxX - L, y: b.minY), NSPoint(x: b.maxX, y: b.minY), NSPoint(x: b.maxX, y: b.minY + L))
+            bracket(NSPoint(x: b.maxX, y: b.maxY - L), NSPoint(x: b.maxX, y: b.maxY), NSPoint(x: b.maxX - L, y: b.maxY))
+            bracket(NSPoint(x: b.minX + L, y: b.maxY), NSPoint(x: b.minX, y: b.maxY), NSPoint(x: b.minX, y: b.maxY - L))
+            centered("已捕获 · ⌘Q 释放", font: .systemFont(ofSize: 10, weight: .medium),
+                     color: NSColor(srgbRed: 0.55, green: 0.71, blue: 1.0, alpha: 1), cy: 24)
+        } else {
+            centered("点击捕获指针", font: .systemFont(ofSize: 13, weight: .medium),
+                     color: NSColor(white: 0.92, alpha: 1), cy: bounds.height / 2 + 8)
+            centered("滑动控制手机 · 双指滚动 = 滚轮", font: .systemFont(ofSize: 9.5),
+                     color: NSColor(white: 0.60, alpha: 1), cy: bounds.height / 2 - 10)
+        }
+    }
+
+    // ===== 键盘 =====
+    // Mac 中文输入法会把标点变成全角,折回半角再查表。
+    // FF01–FF5E 是全角 ASCII 区(,:?!等,减 0xFEE0 即半角);
+    // 。【】《》等是 CJK 专用标点,不在该区,单独查表
     private func normalizeFullWidth(_ c: Character) -> Character? {
         guard let scalar = c.unicodeScalars.first, (0xFF01...0xFF5E).contains(scalar.value) else { return nil }
         guard let ascii = Unicode.Scalar(scalar.value - 0xFEE0) else { return nil }
         return Character(ascii)
     }
+    private let cjkPunctToAscii: [Character: Character] = [
+        "。": ".", "、": ",", "·": "`",
+        "【": "[", "】": "]", "「": "[", "」": "]",
+        "『": "[", "』": "]", "《": "<", "》": ">",
+        "\u{201C}": "\"", "\u{201D}": "\"", "\u{2018}": "'", "\u{2019}": "'",
+        "—": "-", "–": "-", "…": ".", "\u{FFE5}": "$",
+    ]
+    private func normalizePunct(_ c: Character) -> Character? {
+        if let n = normalizeFullWidth(c) { return n }
+        return cjkPunctToAscii[c]
+    }
 
     private func usageFor(_ event: NSEvent) -> (UInt8, Bool)? {
-        // 先查带 Shift 的实际字符(大写/符号),再查裸字符,最后查功能键
         if let chars = event.characters {
             for c in chars {
                 if let (u, s) = charToUsage[c] { return (u, s) }
-                if let n = normalizeFullWidth(c), let (u, s) = charToUsage[n] { return (u, s) }
+                if let n = normalizePunct(c), let (u, s) = charToUsage[n] { return (u, s) }
             }
             if let u16 = chars.utf16.first, let u = functionKeyUsage(u16) { return (u, false) }
         }
         if let c = event.charactersIgnoringModifiers?.first {
             if let (u, s) = charToUsage[c] { return (u, s) }
-            if let n = normalizeFullWidth(c), let (u, s) = charToUsage[n] { return (u, s) }
+            if let n = normalizePunct(c), let (u, s) = charToUsage[n] { return (u, s) }
         }
         return nil
     }
 
+    // ===== 指针捕获 / Cmd+Q =====
+    // Cmd+Q:捕获中 → 释放捕获;未捕获 → 退出应用。命中即吞掉,绝不透传给手机。
+    // performKeyEquivalent 优先接;本应用无菜单栏,事件最终也会走 keyDown,双保险
+    private func isCmdQ(_ e: NSEvent) -> Bool {
+        e.modifierFlags.contains(.command) && e.charactersIgnoringModifiers?.lowercased() == "q"
+    }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if isCmdQ(event) { appDelegate.cmdQPressed(); return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
     override func keyDown(with event: NSEvent) {
+        if isCmdQ(event) { appDelegate.cmdQPressed(); return }
         if let (u, s) = usageFor(event) {
             NSLog("HIDock: [key] down 0x%02X shift=%d", u, s ? 1 : 0)
             kb.keyDown(usage: u, shifted: s); appDelegate.logKey(u, down: true)
         }
     }
     override func keyUp(with event: NSEvent) {
+        if isCmdQ(event) { return }
         if let (u, s) = usageFor(event) { kb.keyUp(usage: u, shifted: s); appDelegate.logKey(u, down: false) }
     }
-    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
     override func flagsChanged(with event: NSEvent) {
         kb.modifiersChanged(HidKeyboard.modifierBits(event.modifierFlags))
     }
+
+    // ===== 触控板 =====
+    private func moveLog(_ tag: String, _ event: NSEvent) {
+        guard Date().timeIntervalSince(lastMoveLog) > 0.3 else { return }
+        lastMoveLog = Date()
+        NSLog("HIDock: [%@] dx=%.1f dy=%.1f scroll=%.1f momentum=%d", tag,
+              event.deltaX, event.deltaY, event.scrollingDeltaY, event.momentumPhase.rawValue)
+    }
+
+    // 12ms 节流合帧(~83Hz):BLE 链路常态容量撑不起 125Hz,留余量防队列饱和
+    private func enqueue(dx: Int, dy: Int, wheel: Int = 0, force: Bool = false) {
+        guard trackpadEnabled else { return }
+        pendingDx += dx; pendingDy += dy; pendingWheel += wheel
+        guard force || mButtons != 0 || Date().timeIntervalSince(lastSent) >= 0.012 else { return }
+        guard force || pendingDx != 0 || pendingDy != 0 || pendingWheel != 0 else { return }
+        func le16(_ x: Int) -> [UInt8] {
+            let u = UInt16(bitPattern: Int16(clamping: x))
+            return [UInt8(u & 0xFF), UInt8(u >> 8)]
+        }
+        // 单帧位移上限:三指拖移这类多指手势会吐出巨大的 delta,一帧把手机指针
+        // 甩到屏幕边缘会触发安卓系统手势(下拉通知栏/边缘返回),打断手机正在
+        // 进行的播报/操作;超限部分直接丢弃,兼作限速
+        func cap(_ x: Int, _ m: Int) -> Int { min(max(x, -m), m) }
+        var d = Data([mButtons])
+        d.append(contentsOf: le16(cap(pendingDx, 1024)))
+        d.append(contentsOf: le16(cap(pendingDy, 1024)))
+        // 滚轮字节要的是 Int8 的补码重解释。曾写成 UInt8(Int8(...)):那是陷阱式
+        // 初始化器,值为负直接 EXC_BREAKPOINT —— 滚轮路径历史崩溃的真正根源
+        d.append(UInt8(bitPattern: Int8(clamping: cap(pendingWheel, 60))))
+        onMouseReport?(d)
+        pendingDx = 0; pendingDy = 0; pendingWheel = 0
+        lastSent = Date()
+    }
+
+    // CGFloat → Int 防御:NaN/无穷/溢出在 Int() 里是运行时陷阱
+    private static func clampDelta(_ f: CGFloat) -> Int {
+        guard f.isFinite, abs(f) < 30000 else { return 0 }
+        return Int(f)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        moveLog("move", event)
+        // 实测 Y 与直觉相反:dy 直接用正 delta(再反了就改回负号)
+        enqueue(dx: CaptureView.clampDelta(event.deltaX), dy: CaptureView.clampDelta(event.deltaY))
+    }
+    override func mouseDragged(with event: NSEvent) {
+        enqueue(dx: CaptureView.clampDelta(event.deltaX), dy: CaptureView.clampDelta(event.deltaY))
+    }
+    override func otherMouseDragged(with event: NSEvent) {
+        enqueue(dx: CaptureView.clampDelta(event.deltaX), dy: CaptureView.clampDelta(event.deltaY))
+    }
+    override func scrollWheel(with event: NSEvent) {
+        moveLog("scroll", event)
+        // 双指滚动 → 手机滚轮(仅纵向;横向要动 Report Map,会让已配对手机的缓存失效,不做)。
+        // 此路径当年 EXC_BREAKPOINT 的根源:直接 Int(scrollingDeltaY) 遇到 NaN/inf 是运行时陷阱,
+        // 统一走 clampDelta 防御即可。方向反了就翻符号
+        let dy = CaptureView.clampDelta(event.scrollingDeltaY)
+        guard dy != 0 else { return }
+        enqueue(dx: 0, dy: 0, wheel: -dy)
+    }
+
+    private func setButton(_ bit: UInt8, on: Bool) {
+        if on { mButtons |= bit } else { mButtons &= ~bit }
+        enqueue(dx: 0, dy: 0, force: true)
+    }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        // 点击面板才开始捕获;用于捕获的这次点击本身不算手机上的点击
+        if !appDelegate.pointerCaptured {
+            appDelegate.capturePointer()
+            return
+        }
+        setButton(0x01, on: true)
+    }
+    override func mouseUp(with event: NSEvent) { setButton(0x01, on: false) }
+    override func rightMouseDown(with event: NSEvent) { setButton(0x02, on: true) }
+    override func rightMouseUp(with event: NSEvent) { setButton(0x02, on: false) }
+    override func otherMouseDown(with event: NSEvent) { setButton(0x04, on: true) }
+    override func otherMouseUp(with event: NSEvent) { setButton(0x04, on: false) }
 }
+
 
 // ---------- App ----------
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
+    var container: NSView!
+    var statusDot: NSView!
     var statusLabel: NSTextField!
+    var hintLabel1: NSTextField!
+    var hintLabel2: NSTextField!
     var logLabel: NSTextField!
-    var captureView: CaptureView!
+    var phonePanel: CaptureView!
+    var orientButton: NSButton!
+    var trackpadButton: NSButton!
+    var githubButton: NSButton!
     let ble = BlePeripheral()
+    // 手机横竖屏,纯状态记录:相对触控板的 delta 映射与朝向无关,窗口样式也不随之变化
+    var landscape = false
+    // 紧凑触控板尺寸(近 Magic Trackpad 比例)
+    static let padW: CGFloat = 380
+    static let padH: CGFloat = 212
+    static let margin: CGFloat = 12
+    static let headerH: CGFloat = 24
+    static let statusH: CGFloat = 18
+    static let footerH: CGFloat = 38
+    var pointerCaptured = false
+    private var grabPoint = NSPoint.zero
+    private var lastStatus = ""
+    // 失焦自动释放捕获时记录的"可自动恢复"期限(Cmd+Q 手动释放不设)
+    private var recaptureDeadline = Date.distantPast
 
     var kb: HidKeyboard { sharedKeyboard }
     func logKey(_ u: UInt8, down: Bool) {
@@ -345,12 +645,152 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // ===== 指针捕获 =====
+    // 冻结系统光标(CGAssociateMouseAndMouseCursorPosition,游戏/远程桌面同款):
+    // 光标停在进入点不再移动,物理位移继续以 deltaX/Y 事件送进来,滑多远都出不了面板
+    func capturePointer() {
+        guard !pointerCaptured else { return }
+        pointerCaptured = true
+        grabPoint = NSEvent.mouseLocation
+        CGAssociateMouseAndMouseCursorPosition(0)
+        NSCursor.hide()
+        statusLabel.stringValue = "指针已捕获 · ⌘Q 释放"
+        statusDot.layer?.backgroundColor = NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 1).cgColor
+        phonePanel.needsDisplay = true
+        NSLog("HIDock: [capture] on")
+    }
+    func releasePointer(recapture: Bool = false) {
+        guard pointerCaptured else { return }
+        pointerCaptured = false
+        CGAssociateMouseAndMouseCursorPosition(1)
+        NSCursor.unhide()
+        // 释放后把光标挪到面板上方的工具栏一带,别留在面板里:
+        // 留在里面的话悬停仍会带动手机光标,还得再挪一步才真正"脱离";
+        // 同时也避免重关联瞬间系统把冻结期间累积的位移一次性倒出来。
+        // AppKit 全局坐标(原点左下)→ CG(原点左上)需要翻 Y
+        let f = window.frame
+        let tx = min(max(grabPoint.x, f.minX + 20), f.maxX - 20)
+        let ty = f.maxY - 50
+        let h = NSScreen.screens.first?.frame.height ?? 0
+        CGWarpMouseCursorPosition(CGPoint(x: tx, y: h - ty))
+        // 手动释放要顺手清掉残留的自动恢复期限,避免之后切窗被意外重新捕获
+        recaptureDeadline = recapture ? Date().addingTimeInterval(5) : .distantPast
+        statusLabel.stringValue = lastStatus
+        statusDot.layer?.backgroundColor = statusColor(lastStatus).cgColor
+        phonePanel.needsDisplay = true
+        NSLog("HIDock: [capture] off")
+    }
+    // Cmd+Q:捕获中 → 脱离;未捕获 → 退出。Cmd 按下时 flagsChanged 已把
+    // GUI 修饰位发去手机,这里补一帧空报文清掉,避免手机端 Meta 悬挂
+    @objc func cmdQPressed() {
+        if pointerCaptured {
+            releasePointer()
+        } else {
+            releasePointer()
+            NSApp.terminate(nil)
+        }
+        kb.modifiersChanged(0)
+    }
+    // Cmd+Tab 切走 / 系统弹窗抢焦点时自动放开,别把用户锁死在捕获里。
+    // 多指系统手势(四指上滑=Mission Control 等)抢走焦点也走这里,标记可恢复
+    @objc private func autoReleaseCapture(_ n: Notification) { releasePointer(recapture: true) }
+    // 5 秒内窗口重新拿到焦点:光标放回面板中心,自动恢复捕获,不用再点一次
+    @objc private func winBecameKey(_ n: Notification) {
+        guard Date() < recaptureDeadline, !pointerCaptured else { return }
+        recaptureDeadline = .distantPast
+        let f = phonePanel.frame
+        // convertToScreen 只收 NSRect,塞个零尺寸矩形取中点
+        let c = window.convertToScreen(NSRect(x: f.midX, y: f.midY, width: 0, height: 0)).origin
+        let h = NSScreen.screens.first?.frame.height ?? 0
+        CGWarpMouseCursorPosition(CGPoint(x: c.x, y: h - c.y))
+        capturePointer()
+    }
+
+    @objc func toggleTrackpad(_ sender: NSButton) {
+        phonePanel.trackpadEnabled.toggle()
+        sender.title = phonePanel.trackpadEnabled ? "触控板 开" : "触控板 关"
+    }
+    // 手机横竖屏只是状态记录:相对触控板的 delta 映射与朝向无关,窗口也不变
+    @objc func toggleOrientation(_ sender: NSButton) {
+        landscape.toggle()
+        sender.title = landscape ? "手机横屏" : "手机竖屏"
+    }
+    @objc func openGitHub(_ sender: NSButton) {
+        NSWorkspace.shared.open(URL(string: "https://github.com/ahhTou/HIDock")!)
+    }
+
+    // 状态色:连接=绿 / 广播=琥珀 / 异常=红 / 其他=灰
+    private func statusColor(_ s: String) -> NSColor {
+        if s.contains("已连接") || s.contains("就绪") { return NSColor(srgbRed: 0.19, green: 0.64, blue: 0.42, alpha: 1) }
+        if s.contains("广播") { return NSColor(srgbRed: 0.96, green: 0.65, blue: 0.14, alpha: 1) }
+        if s.contains("未就绪") || s.contains("失败") { return NSColor(srgbRed: 0.90, green: 0.28, blue: 0.30, alpha: 1) }
+        return NSColor(white: 0.55, alpha: 1)
+    }
+
+    private func makeToolButton(_ title: String, _ action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .recessed
+        b.controlSize = .small
+        b.font = .systemFont(ofSize: 11)
+        b.setContentHuggingPriority(.required, for: .horizontal)
+        return b
+    }
+
+    // 红绿灯实际中线(窗口坐标)。成为 key window 后 AppKit 会异步重摆一次标准按钮,
+    // 跟系统抢位置会"闪一下又弹回去";正确做法是不动红绿灯,让工具按钮贴过去
+    private func lightCenterY() -> CGFloat? {
+        guard let close = window.standardWindowButton(.closeButton), let sv = close.superview else { return nil }
+        return sv.convert(NSPoint(x: close.frame.midX, y: close.frame.midY), to: nil).y
+    }
+
+    // 固定尺寸四段:按钮行(与红绿灯同带) / 状态独占一行 / 触控板表面 / 提示脚注
+    func layoutWindow() {
+        let M = Self.margin
+        let W = Self.padW + M * 2
+        let H = Self.padH + M * 2 + Self.headerH + Self.statusH + Self.footerH + 26
+        container.frame = NSRect(x: 0, y: 0, width: W, height: H)
+
+        // 第 1 行:工具按钮与红绿灯同中线(读系统实际位置;拿不到时退回标题栏中线)
+        let row1Center = lightCenterY() ?? (H - 14)
+        var bx = W - M
+        for b in [trackpadButton!, orientButton!] {
+            let w = ceil(b.fittingSize.width) + 10
+            bx -= w
+            b.frame = NSRect(x: bx, y: row1Center - 10, width: w, height: 20)
+            bx -= 8
+        }
+        // 第 2 行:当前状态独占一行,不再和按钮挤
+        let row2Y = H - M - Self.headerH - 8 - Self.statusH
+        statusDot.frame = NSRect(x: M, y: row2Y + 5, width: 8, height: 8)
+        statusLabel.frame = NSRect(x: M + 14, y: row2Y + 2, width: W - M * 2 - 14, height: 14)
+        phonePanel.frame = NSRect(x: M, y: M + Self.footerH + 10, width: Self.padW, height: Self.padH)
+        hintLabel1.frame = NSRect(x: M, y: M + 22, width: W - M * 2, height: 12)
+        hintLabel2.frame = NSRect(x: M, y: M + 8, width: W * 0.6, height: 12)
+        // 右下角:GitHub 入口(最右,圆形白底) + 键码小字(让出图标宽度)
+        githubButton.frame = NSRect(x: W - M - 20, y: M + 4, width: 20, height: 20)
+        logLabel.frame = NSRect(x: W * 0.6, y: M + 8, width: W - M - W * 0.6 - 28, height: 12)
+        orientButton.title = landscape ? "手机横屏" : "手机竖屏"
+        trackpadButton.title = phonePanel.trackpadEnabled ? "触控板 开" : "触控板 关"
+        window.setContentSize(NSSize(width: W, height: H))
+        window.center()
+    }
+
+    // 成 key 后红绿灯会被系统重摆一次(仍是默认位置);重读一次中线、贴一次按钮,兜底
+    private func realignRow1ToLights() {
+        guard let c = lightCenterY() else { return }
+        for b in [trackpadButton!, orientButton!] { b.frame.origin.y = c - b.frame.height / 2 }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildCharTable()
         sharedKeyboard.ble = ble
         ble.onStatus = { text in
             NSLog("HIDock: %@", text)
-            DispatchQueue.main.async { self.statusLabel.stringValue = text }
+            DispatchQueue.main.async {
+                self.lastStatus = text
+                if !self.pointerCaptured { self.statusLabel.stringValue = text }
+                self.statusDot.layer?.backgroundColor = self.statusColor(text).cgColor
+            }
         }
         ble.onCentralsChanged = { n in
             DispatchQueue.main.async {
@@ -358,32 +798,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 320),
-                          styleMask: [.titled, .closable, .miniaturizable],
+        // 透明标题栏 + fullSizeContentView:原生红绿灯/圆角/阴影/标题栏拖动全保留,
+        // 内容铺满窗口,视觉上等同无边框;绿色缩放键对固定尺寸工具无意义,隐藏
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: Self.padW + Self.margin * 2,
+                                             height: Self.padH + Self.margin * 2 + Self.headerH + Self.statusH + Self.footerH + 26),
+                          styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
-        window.title = "HIDock — 手搓版 Type2Phone"
+        window.title = "HIDock"
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.appearance = NSAppearance(named: .darkAqua)   // 工具统一深色,不随系统主题漂移
+        window.backgroundColor = NSColor(srgbRed: 0.055, green: 0.055, blue: 0.063, alpha: 1)
+        window.isMovableByWindowBackground = true            // 标题栏条 + 空白处都可拖动
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+
+        container = NSView(frame: .zero)
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor(srgbRed: 0.055, green: 0.055, blue: 0.063, alpha: 1).cgColor
+
+        statusDot = NSView(frame: NSRect(x: 0, y: 0, width: 8, height: 8))
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 4
+        statusDot.layer?.backgroundColor = NSColor(white: 0.55, alpha: 1).cgColor
 
         statusLabel = NSTextField(labelWithString: "初始化蓝牙…")
-        statusLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        statusLabel.frame = NSRect(x: 20, y: 270, width: 420, height: 20)
+        statusLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        statusLabel.textColor = NSColor(white: 0.92, alpha: 1)
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.cell?.truncatesLastVisibleLine = true
+        statusLabel.cell?.wraps = false
+
+        hintLabel1 = NSTextField(labelWithString: "单击 = 左键 · 右键 = 返回 · 双指滚动 = 滚轮")
+        hintLabel2 = NSTextField(labelWithString: "点击面板捕获指针 · 按住空白处拖动 · ⌘Q 退出")
+        for h in [hintLabel1!, hintLabel2!] {
+            h.font = .systemFont(ofSize: 9.5)
+            h.textColor = NSColor(white: 0.50, alpha: 1)
+        }
 
         logLabel = NSTextField(labelWithString: "")
-        logLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        logLabel.textColor = .tertiaryLabelColor
-        logLabel.frame = NSRect(x: 20, y: 248, width: 420, height: 16)
+        logLabel.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
+        logLabel.textColor = NSColor(white: 0.40, alpha: 1)
+        logLabel.alignment = .right
 
-        captureView = CaptureView(frame: NSRect(x: 0, y: 0, width: 460, height: 240))
+        phonePanel = CaptureView(frame: NSRect(x: 0, y: 0, width: Self.padW, height: Self.padH))
+        phonePanel.onMouseReport = { appDelegate.ble.sendMouseReport($0) }
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 320))
+        orientButton = makeToolButton("手机竖屏", #selector(toggleOrientation(_:)))
+        trackpadButton = makeToolButton("触控板 开", #selector(toggleTrackpad(_:)))
+
+        githubButton = NSButton(title: "", target: self, action: #selector(openGitHub(_:)))
+        if let mark = githubMarkImage() {
+            mark.size = NSSize(width: 12, height: 12)   // 图标在 20pt 圆内留边,不顶满
+            githubButton.image = mark
+        }
+        githubButton.imagePosition = .imageOnly
+        githubButton.imageScaling = .scaleProportionallyDown
+        githubButton.isBordered = false
+        githubButton.contentTintColor = NSColor(srgbRed: 0.14, green: 0.16, blue: 0.18, alpha: 1)  // GitHub 品牌深灰
+        githubButton.toolTip = "GitHub · ahhTou/HIDock"
+        // 圆形白底,图标居中
+        githubButton.wantsLayer = true
+        githubButton.layer?.backgroundColor = NSColor.white.cgColor
+        githubButton.layer?.cornerRadius = 10
+        githubButton.layer?.masksToBounds = true
+
+        container.addSubview(statusDot)
         container.addSubview(statusLabel)
+        container.addSubview(hintLabel1)
+        container.addSubview(hintLabel2)
         container.addSubview(logLabel)
-        container.addSubview(captureView)
+        container.addSubview(githubButton)
+        container.addSubview(orientButton)
+        container.addSubview(trackpadButton)
+        container.addSubview(phonePanel)
         window.contentView = container
-        window.center()
+        layoutWindow()
         window.makeKeyAndOrderFront(nil)
-        window.initialFirstResponder = captureView
+        realignRow1ToLights()   // 系统重摆红绿灯后兜底再贴一次(幂等)
+        window.initialFirstResponder = phonePanel
         NSApp.activate(ignoringOtherApps: true)
+
+        // 捕获期间窗口失焦/应用失活 → 自动释放,防止用户被锁在捕获态;
+        // 短时间内切回来则自动恢复捕获(见 winBecameKey)
+        NotificationCenter.default.addObserver(self, selector: #selector(autoReleaseCapture),
+            name: NSWindow.didResignKeyNotification, object: window)
+        NotificationCenter.default.addObserver(self, selector: #selector(autoReleaseCapture),
+            name: NSApplication.didResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(winBecameKey),
+            name: NSWindow.didBecomeKeyNotification, object: window)
     }
+
+    func applicationWillTerminate(_ notification: Notification) { releasePointer() }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
