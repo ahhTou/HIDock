@@ -4,6 +4,7 @@
 # 用法:
 #   ./build.sh                       构建 build/HIDock.app 并自动签名
 #   ./build.sh --dist                额外产出 dist/HIDock-<版本>-<架构>.zip(分发用)
+#   SIGN=adhoc ./build.sh --dist     强制 ad-hoc 签名的分发包(不嵌开发者邮箱)
 #   ./build.sh --notarize            有 Developer ID 证书时:提交公证 + staple(需先配置
 #                                    xcrun notarytool store-credentials HIDock ...)
 #   ARCHS="arm64 x86_64" ./build.sh  通用二进制(Intel Mac 也能跑)
@@ -37,6 +38,13 @@ rm -f "${OBJS[@]}"
 cp Info.plist "$APP/Contents/Info.plist"
 
 # ---------- 2. 选签名证书 ----------
+# SIGN=adhoc 强制 ad-hoc 签名,供分发产物使用:Apple Development 证书的签名里
+# 嵌着开发者邮箱,而未公证时它对下载者的 Gatekeeper 待遇与 ad-hoc 完全相同,
+# 发布版本不带个人信息为净
+if [[ "${SIGN:-}" == "adhoc" ]]; then
+    IDENTITY="-"
+    SIGN_MODE="adhoc"
+else
 IDENTITIES=$(security find-identity -v -p codesigning 2>/dev/null || true)
 IDENTITY=$(echo "$IDENTITIES" | sed -nE 's/.*"([^"]*Developer ID Application[^"]*)".*/\1/p' | head -n1)
 SIGN_MODE="developer-id"
@@ -47,6 +55,7 @@ fi
 if [[ -z "$IDENTITY" ]]; then
     IDENTITY="-"
     SIGN_MODE="adhoc"
+fi
 fi
 echo "==> 签名 ($SIGN_MODE): $IDENTITY"
 
