@@ -22,9 +22,11 @@
 ```bash
 git clone https://github.com/ahhTou/HIDock.git
 cd HIDock
-swiftc -O -o HIDock main.swift
-./HIDock
+./build.sh                 # 编译 + 打包成 build/HIDock.app(自动签名)
+open build/HIDock.app
 ```
+
+打包成 .app 后蓝牙权限只弹一次、归属稳定(`NSBluetoothAlwaysUsageDescription` 见 `Info.plist`);想跑裸二进制仍然可以 `swiftc -O -o HIDock main.swift`。
 
 点一下窗口获得焦点即可打字;点击触控板面板开始控制。想开机自启可以把它加进登录项。
 
@@ -45,7 +47,7 @@ swiftc -O -o HIDock main.swift
 - 中文上屏依赖手机输入法的物理键盘拼音能力(讯飞可以,GBoard 不行);
 - 打字期间焦点必须在 HIDock 窗口里;触控板无捕获状态时,悬停移动也会带动手机指针;
 - 多指手势里只有双指滚动能透传(协议限制:HID 鼠标无多点触控,三指手势会被当成大位移,已做限幅防误触系统手势);
-- 没有打包、签名、自动更新,就是个裸二进制;
+- 打包/签名:`build.sh` 产出 ad-hoc 签名的 .app,本机即开即用;**未公证**——直接发给别人,对方首次打开需在「系统设置 → 随私与安全性」点「仍要打开」放行一次(有 Apple Developer 账号可 `./build.sh --notarize` 消除这一步);无自动更新;
 - 样本量 = 一台手机,你的设备上能不能跑全凭运气;
 - macOS 若继续收紧第三方 BLE HID 权限,随时可能失效。
 
